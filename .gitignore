@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+
+# Files
+data/
+test/
+
+# Editor
+.vscode/
+.idea/
+*.swp
