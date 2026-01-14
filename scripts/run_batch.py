@@ -57,7 +57,7 @@ def run_single_simulation(algo_name: str, scenario_path: str, args) -> Dict[str,
     args.file = scenario_path
     args.algorithm = algo_name
     
-    # [Topology Hack] Original PI requires ROW topology
+    # Original PI requires ROW topology
     user_network_choice = args.network
     if algo_name == "original":
         args.network = "row"
@@ -67,12 +67,12 @@ def run_single_simulation(algo_name: str, scenario_path: str, args) -> Dict[str,
     # 2. Setup
     tasks, agents, topology = main.setup_scenario(args)
     
-    # [OPTIMIZATION] Snapshot initial agent states for lazy feasibility checking later.
-    # We store only what's needed to calculate reachability (Physics).
+    # Snapshot initial agent states for lazy feasibility checking later
+    # We store only what's needed to calculate reachability (Physics)
     initial_agent_states = [
         {
-            'pos': np.copy(a.position), 
-            'speed': a.speed, 
+            'pos': np.copy(a.position),
+            'speed': a.speed,
             'type': a.agent_type
         } 
         for a in agents
@@ -105,12 +105,11 @@ def run_single_simulation(algo_name: str, scenario_path: str, args) -> Dict[str,
     cpu_time = time.process_time() - start_time
 
     # 5. Metrics & Lazy Evaluation
-    
     # Identify tasks that were NOT completed
     incomplete_tasks = [t for t in tasks if not t.completed]
     completed_count = len(tasks) - len(incomplete_tasks)
     
-    # [LAZY CHECK] Only if there are failures, verify if they were "excusable"
+    # Only if there are failures, verify if they were "excusable"
     impossible_count = 0
     if incomplete_tasks:
         for t in incomplete_tasks:
@@ -178,7 +177,7 @@ def batch_run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--algo", dest="target_algo", type=str, required=True, 
-                        choices=["original", "v1", "v2", "v3"])
+                        choices=["original", "dynamic"])
     
     parser.add_argument("-r", "--radius", type=float, default=350.0)
     parser.add_argument("--max_time", type=float, default=5000.0)

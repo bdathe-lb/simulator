@@ -8,9 +8,7 @@
 
 from algorithms.base import BaseAlgorithm
 from algorithms.original_pi import OriginalPI
-from algorithms.basic_dynamic import BasicDynamicPI
-from algorithms.robust_dynamic import RobustDynamicPI
-from algorithms.optimized_dynamic import OptimizedDynamicPI
+from algorithms.dynamic_pi import DynamicPI
 from typing import List
 from core.task import Task
 
@@ -35,11 +33,7 @@ class AlgorithmFactory:
         """
         if algo_name == "original":
             return OriginalPI(agent_id, max_tasks, all_tasks)
-        elif algo_name == "v1":
-            return BasicDynamicPI(agent_id, max_tasks, all_tasks)
-        elif algo_name == "v2":
-            return RobustDynamicPI(agent_id, max_tasks, all_tasks)
-        elif algo_name == "v3":
-            return OptimizedDynamicPI(agent_id, max_tasks, all_tasks)
+        elif algo_name == "dynamic":
+            return DynamicPI(agent_id, max_tasks, all_tasks)
         else:
             raise ValueError(f"Unknown algorithm name: {algo_name}")

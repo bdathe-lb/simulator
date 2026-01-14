@@ -95,7 +95,7 @@ class Agent:
                 current_plan = self.algorithm.get_plan()
                 continue
             break
-
+            
         # If no vaild tasks, become 'IDLE'
         if not current_plan:
             self.status = 'IDLE'

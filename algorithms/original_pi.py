@@ -3,8 +3,6 @@
 # Implemented PI-Avg. based on the paper.
 # --------------------------------------------------------
 
-# The feature implementation is correct fine.
-
 import numpy as np
 import math
 from typing import List, Dict, Any, Tuple

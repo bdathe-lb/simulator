@@ -29,7 +29,7 @@ def generate(args):
     # Reuse main.py logic to setup and save
     args.save = True
     args.load = False
-    args.algorithm = 'v2' # Dummy algo, doesn't affect position generation
+    args.algorithm = 'dynamic' # Dummy algo, doesn't affect position generation
     
     for i in range(args.count):
         filename = os.path.join(OUTPUT_DIR, f"scenario_{i}.txt")

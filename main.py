@@ -302,7 +302,7 @@ def parse_args():
     
     # Algorithm Selection
     parser.add_argument("--algo", dest="algorithm", type=str, default="v2", 
-                        choices=["original", "v1", "v2", "v3"], help="Algorithm strategy to use.")
+                        choices=["original", "dynamic"], help="Algorithm strategy to use.")
     
     # Simulation Config
     parser.add_argument("-a", "--agents", type=int, default=NUM_AGENTS, help="Number of agents")
