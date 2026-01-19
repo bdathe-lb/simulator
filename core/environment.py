@@ -53,7 +53,7 @@ class Environment:
         self.fixed_topology = fixed_topology  
 
     # *****************************************
-    # Mode 1: Dynamic Simulation (For V1, V2)
+    # Mode 1: Dynamic Simulation
     # *****************************************
     def run_dynamic_simulation(self, dt: float, max_time: float) -> Iterator[Dict[str, Any]]:
         """

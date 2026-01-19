@@ -8,7 +8,7 @@ fi
 
 ALGO=$1
 
-if ! [[ "$ALGO" =~ ^(original|v1|v2)$ ]]; then
+if ! [[ "$ALGO" =~ ^(original|dynamic)$ ]]; then
     echo "Error: Invalid ALGO. Must be one of: original, V1, V2" >&2
     exit 1
 fi

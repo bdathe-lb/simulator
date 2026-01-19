@@ -10,3 +10,6 @@ test/
 .vscode/
 .idea/
 *.swp
+
+# Scripts
+*.sh

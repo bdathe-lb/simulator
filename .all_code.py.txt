@@ -1,0 +1,2311 @@
+# Combined Python source files
+# Root: .
+# Generated: 2026-01-15T13:53:16+08:00
+
+##### FILE: ./algorithms/base.py #####
+
+# --------------------------------------------------------
+# File: core/base.py
+# Implement base classes for each algorithm, defining the 
+# basic framework of the algorithms.
+# --------------------------------------------------------
+
+# The feature implementation is correct fine.
+
+from abc import ABC, abstractmethod
+from typing import List, Dict, Any
+from core.task import Task
+
+class BaseAlgorithm(ABC):
+    """
+    Abstract base class for all task allocation algorithms.
+
+    This class defines the standard interface that the Agent class uses to
+    interact with decision-making logic. Any specific algorithm implementation
+    (e.g., Original PI, Dynamic PI) must inherit from this class.
+
+    Attributes:
+        agent_id (int): ID of the agent owning this algorithm instance.
+        max_tasks (int): Maximum number of tasks the agent can handle.
+        all_tasks (List[Task]): Reference to the global task list.
+    """
+    
+    def __init__(self, agent_id: int, max_tasks: int, all_tasks: List[Task]) -> None:
+        """
+        Initializes the base algorithm state.
+
+        Args:
+            agent_id: The ID of the agent.
+            max_tasks: Capacity constraint for the agent.
+            all_tasks: List of all available tasks in the environment.
+        """
+        self.agent_id = agent_id
+        self.max_tasks = max_tasks
+        self.all_tasks = all_tasks
+
+        # Derived classed should Initialize their specific data structures here
+        # e.g., `significance_list`, `timestamp_list`, etc.
+
+    @abstractmethod
+    def bind_agent(self, agent: Any) -> None:
+        """
+        Binds the physical agent instance to the algorithm.
+        """
+        self.agent = agent
+
+    @abstractmethod
+    def finalize_setup(self, feasibility_matrix: List[List[bool]]) -> None:
+        """
+        Performs second-stage initialization with global info.
+
+        Args:
+            feasibility_matrix: A matrix indicating which tasks are feasible
+                                for which agents.
+        """
+        pass
+
+    @abstractmethod
+    def run_iteration(self, messages: List[Dict[str, Any]]) -> None:
+        """
+        Executes one iteration of the algorithm (e.g., inclusion, consensus, removal).
+
+        Args:
+            messages: A list of messages received from neighboring agents.
+        """
+        pass
+
+    @abstractmethod
+    def get_plan(self) -> List[int]:
+        """
+        Retrieves the current task execution sequence decided by the algorithm.
+
+        Returns:
+            A list of task IDs representing the planned path.
+        """
+        pass 
+
+    @abstractmethod
+    def pack_message(self) -> Dict[str, Any]:
+        """
+        Packs the internal state into a message dictionary for broadcasting.
+
+        Returns:
+            A dictionary containing relevant algorithm state (e.g., bids,
+            timestamps) to be sent to neighbors.
+        """
+        pass
+
+    # --- Hooks for Dynamic Events (Optional for Static Algos) ---
+    def on_task_completed(self, task_id: int) -> None:
+        """
+        Hook called when the agent physically completes a task.
+
+        Args:
+            task_id: The ID of the completed task.
+        """
+        pass
+
+    def on_task_locked(self, task_id: int) -> None:
+        """
+        Hook called when the agent physically starts executing a task (locks it).
+
+        Args:
+            task_id: The ID of the task being locked.
+        """
+        pass
+
+##### END FILE: ./algorithms/base.py #####
+
+##### FILE: ./algorithms/dynamic_pi.py #####
+
+# --------------------------------------------------------
+# File: algorithms/dynamic_pi.py
+# --------------------------------------------------------
+
+import math
+import numpy as np
+from typing import List, Dict, Any, Tuple
+from algorithms.base import BaseAlgorithm
+from core.task import Task
+
+# Constants
+INFINITY = float('inf')
+
+class DynamicPI(BaseAlgorithm):
+    """
+    Implements the V3 Optimized Dynamic Algorithm (Standalone).
+
+    This class consolidates logic from Original PI, V1, and V2 into a single
+    optimized implementation. It features tiered task inclusion, pinned 2-opt
+    path optimization, and robust handling for dynamic environments (congestion
+    awareness, blacklisting, and execution locking).
+    """
+
+    def __init__(self, agent_id: int, max_tasks: int, all_tasks: List[Task]) -> None:
+        """
+        Initializes the V3 algorithm with all necessary state variables.
+        """
+        super().__init__(agent_id, max_tasks, all_tasks)
+        
+        num_tasks = len(all_tasks)
+
+        # --- Basic PI State (Originally from OriginalPI) ---
+        self.tasks_sequence_list: List[int] = []
+        self.significance_list: List[float] = [INFINITY] * num_tasks
+        # Note: assigned_agent_list tracks who we think owns the task
+        self.assigned_agent_list: List[int] = [-1] * num_tasks 
+        self.marginal_significance_list: List[float] = [0.0] * num_tasks
+        
+        # --- Robust State (Originally from RobustDynamicPI) ---
+        # Timestamps for Scalar Clock Consensus
+        self.task_timestamps: List[float] = [0.0] * num_tasks
+        # Blacklist: {task_id -> expiration_time}
+        self.blacklist: Dict[int, float] = {}
+        # Execution Locks: {task_id -> agent_id} (Who is physically executing what)
+        self.known_execution_locks: Dict[int, int] = {}
+        
+        # Internal State
+        self.current_time = 0.0
+        self._is_currently_congested = False
+        self.agent = None
+        self.feasibility_matrix = []
+
+        # --- Configuration Parameters ---
+        self.BLACKLIST_DURATION = 10.0
+        self.PASSIVE_COOLING_DURATION = 3.0
+        self.STALE_TIMEOUT = 30.0 
+        self.INERTIA_THRESHOLD = 15.0 
+        self.HARD_LOCK_SIG = -1.0
+        self.CONGESTION_RADIUS = 20.0 
+        self.CONGESTION_PENALTY = 2000.0 
+
+    # *******************************************************
+    # Interface Implementation (From BaseAlgorithm)
+    # *******************************************************
+
+    def bind_agent(self, agent: Any) -> None:
+        self.agent = agent
+
+    def finalize_setup(self, feasibility_matrix: List[List[bool]]) -> None:
+        self.feasibility_matrix = feasibility_matrix
+
+    def get_plan(self) -> List[int]:
+        return self.tasks_sequence_list
+
+    def pack_message(self) -> Dict[str, Any]:
+        """
+        Packs state for broadcast. Includes Hard Lock logic from V2.
+        """
+        # [Fix] Ensure agent is bound before accessing attributes
+        assert self.agent is not None, "Agent must be bound before packing messages"
+
+        broadcast_sig = list(self.significance_list)
+        
+        # Override bid with HARD_LOCK if physically executing
+        if self.agent.status == 'EXECUTING' and self.agent.current_target_task_id is not None:
+            tid = self.agent.current_target_task_id
+            broadcast_sig[tid] = self.HARD_LOCK_SIG
+
+        return {
+            "sender_id": self.agent_id,
+            "significance_list": broadcast_sig,
+            "assigned_agent_list": self.assigned_agent_list,
+            "sender_target_id": self.agent.current_target_task_id,
+            "task_timestamps": self.task_timestamps,
+            "sender_status": self.agent.status,
+            "sender_position": self.agent.position
+        }
+
+    # *******************************************************
+    # Dynamic Event Hooks
+    # *******************************************************
+
+    def on_task_completed(self, task_id: int) -> None:
+        if task_id in self.tasks_sequence_list:
+            self.tasks_sequence_list.remove(task_id)
+        if task_id in self.known_execution_locks:
+            del self.known_execution_locks[task_id]
+
+    def on_task_locked(self, task_id: int) -> None:
+        self.task_timestamps[task_id] = self.current_time
+        self.known_execution_locks[task_id] = self.agent_id
+        self.significance_list[task_id] = self.HARD_LOCK_SIG
+
+    # *******************************************************
+    # Main Loop
+    # *******************************************************
+
+    def run_iteration(self, messages: List[Dict[str, Any]]) -> None:
+        # [Fix] Ensure agent is bound for the iteration
+        assert self.agent is not None, "Agent must be bound to run iteration"
+
+        self.current_time += 1.0
+
+        # 1. Update Congestion Status
+        self._is_currently_congested = self._calculate_congestion_status(messages)
+
+        # 2. Maintenance
+        self._check_stale_information()
+        
+        # 3. Phases
+        self._task_inclusion_phase() # V3 Tiered Logic
+        self._consensus_phase(messages) # V2 Robust Logic
+        self._task_removal_phase()   # V3 Optimized Removal
+        
+        # 4. Cleanup
+        self._cleanup_blacklist()
+
+    # *******************************************************
+    # Phase 1: Inclusion (V3 Tiered Strategy)
+    # *******************************************************
+
+    def _task_inclusion_phase(self) -> None:
+        """
+        V3 Strategy: Tiered Sorting + Greedy Insertion.
+        """
+        # [Fix] Ensure agent exists
+        assert self.agent is not None
+
+        # Early exit if full and busy
+        if self.agent.status == 'EXECUTING' and len(self.tasks_sequence_list) >= self.max_tasks:
+            return
+        
+        is_desperate = (len(self.tasks_sequence_list) == 0)
+        penalty = self.CONGESTION_PENALTY if (self._is_currently_congested and not is_desperate) else 0.0
+
+        # 1. Filter Candidates
+        candidate_tasks = [
+            t for t in self.all_tasks 
+            if not t.completed and 
+            t.id not in self.blacklist and 
+            t.id not in self.tasks_sequence_list and 
+            self.feasibility_matrix[self.agent_id][t.id]
+        ]
+        
+        # 2. Tiered Sorting Strategy
+        URGENCY_THRESHOLD = 150.0 
+        current_t = self.current_time
+        
+        def tiered_sort_key(task):
+            # [Fix] self.agent is already asserted not None above
+            time_left = task.deadline - current_t
+            if time_left < URGENCY_THRESHOLD:
+                # Tier 1: Critical (Sort by Deadline)
+                return (0, task.deadline)
+            else:
+                # Tier 2: Safe (Sort by Distance)
+                dist = np.linalg.norm(task.position - self.agent.position) # type: ignore
+                return (1, dist)
+
+        candidate_tasks.sort(key=tiered_sort_key)
+
+        # 3. Greedy Insertion
+        while len(self.tasks_sequence_list) < self.max_tasks:
+            max_diff = -INFINITY
+            best_task = -1
+            best_pos = -1
+
+            for task in candidate_tasks:
+                # Skip locked tasks
+                if self.significance_list[task.id] == self.HARD_LOCK_SIG: 
+                    continue
+                if task.id in self.known_execution_locks:
+                    if self.known_execution_locks[task.id] != self.agent_id: 
+                        continue
+
+                # Calculate Marginal
+                marginal, pos = self._calculate_marginal_significance(task)
+                marginal += penalty
+
+                # Strict Deadline Check
+                if math.isinf(marginal): 
+                    continue
+                arrival_time = self.current_time + self._calculate_reach_time(task.id, pos)
+                if arrival_time > task.deadline: 
+                    continue
+
+                # Calculate Gain
+                diff = self.significance_list[task.id] - marginal
+
+                if diff > 1e-4 and diff > max_diff:
+                    max_diff = diff
+                    best_task = task.id
+                    best_pos = pos
+            
+            if max_diff > 0:
+                self.tasks_sequence_list.insert(best_pos, best_task)
+                self.significance_list[best_task] = max_diff # Store gain as significance
+                self.assigned_agent_list[best_task] = self.agent_id
+                self.task_timestamps[best_task] = self.current_time
+                # Remove from candidates
+                candidate_tasks = [t for t in candidate_tasks if t.id != best_task]
+            else:
+                break
+        
+        # 4. Post-Inclusion Optimization
+        self._optimize_path_with_pinned_2opt()
+
+        # 5. Cascade Update
+        self._update_internal_significance(penalty)
+
+    # *******************************************************
+    # Phase 2: Consensus (V2 Robust Logic)
+    # *******************************************************
+
+    def _consensus_phase(self, messages: List[Dict]) -> None:
+        """
+        Resolves conflicts using Scalar Timestamps, Inertia, and Hard Locks.
+        """
+        # [Fix] Ensure agent is bound
+        assert self.agent is not None
+
+        # Part A: Update Execution Locks Cache
+        for msg in messages:
+            n_id = msg['sender_id']
+            n_status = msg.get('sender_status', 'IDLE')
+            n_target = msg.get('sender_target_id', None)
+
+            if n_status == 'EXECUTING' and n_target is not None:
+                self.known_execution_locks[n_target] = n_id
+            
+            # Remove stale locks
+            keys_to_delete = [tid for tid, owner in self.known_execution_locks.items() 
+                              if owner == n_id and (n_status != 'EXECUTING' or n_target != tid)]
+            for k in keys_to_delete:
+                del self.known_execution_locks[k]
+
+        # Part B: Bidding & Consensus
+        for msg in messages:
+            n_id = msg['sender_id']
+            n_sig = msg['significance_list']
+            n_assign = msg['assigned_agent_list']
+            n_ts = msg['task_timestamps']
+
+            num_tasks = len(self.all_tasks)
+            for tid in range(num_tasks):
+                # Rule 1: Self Executing -> I win
+                am_executing = (self.agent.status == 'EXECUTING' and 
+                                self.agent.current_target_task_id == tid)
+                if am_executing:
+                    self.task_timestamps[tid] = self.current_time
+                    continue
+
+                # Rule 2: Neighbor Hard Lock -> They win
+                if n_sig[tid] == self.HARD_LOCK_SIG:
+                     if tid in self.tasks_sequence_list or self.assigned_agent_list[tid] == self.agent_id:
+                          self.blacklist[tid] = self.current_time + self.BLACKLIST_DURATION
+                     
+                     self.significance_list[tid] = self.HARD_LOCK_SIG
+                     self.assigned_agent_list[tid] = n_id
+                     self.task_timestamps[tid] = max(self.task_timestamps[tid], n_ts[tid], self.current_time)
+                     continue
+                
+                # Rule 3: Standard Consensus (Scalar Timestamp + Inertia)
+                ts_local = self.task_timestamps[tid]
+                ts_neighbor = n_ts[tid]
+                i_am_owner = (self.assigned_agent_list[tid] == self.agent_id)
+                
+                # Case A: Neighbor is strictly newer
+                if ts_neighbor > ts_local:
+                    if i_am_owner:
+                        # Inertia Check
+                        if n_sig[tid] < self.significance_list[tid] - self.INERTIA_THRESHOLD:
+                            self._accept_neighbor_info(tid, n_sig, n_assign, ts_neighbor)
+                        else:
+                            self.task_timestamps[tid] = max(ts_local, ts_neighbor)
+                    else:
+                         self._accept_neighbor_info(tid, n_sig, n_assign, ts_neighbor)
+
+                # Case B: Concurrent (Approx Equal)
+                elif math.isclose(ts_neighbor, ts_local):
+                    threshold = self.INERTIA_THRESHOLD if i_am_owner else 0.0
+                    if n_sig[tid] < self.significance_list[tid] - threshold:
+                         self._accept_neighbor_info(tid, n_sig, n_assign, ts_neighbor)
+                
+                # Consistency Check
+                if n_id == self.assigned_agent_list[tid] and self.significance_list[tid] != self.HARD_LOCK_SIG:
+                     if abs(n_sig[tid] - self.significance_list[tid]) > 1e-6:
+                         self.significance_list[tid] = n_sig[tid]
+
+    def _accept_neighbor_info(self, tid, n_sig, n_assign, ts):
+        self.significance_list[tid] = n_sig[tid]
+        self.assigned_agent_list[tid] = n_assign[tid]
+        self.task_timestamps[tid] = ts
+
+    # *******************************************************
+    # Phase 3: Removal (V3 Optimization + V2 Logic)
+    # *******************************************************
+
+    def _task_removal_phase(self) -> None:
+        """
+        Combines V3's Pre-Removal Optimization with V2's Removal Logic.
+        """
+        # [Fix] Ensure agent is bound
+        assert self.agent is not None
+
+        # 1. Optimization Attempt
+        self._optimize_path_with_pinned_2opt()
+        
+        # 2. Update Significance before checking removal conditions
+        penalty = self.CONGESTION_PENALTY if self._is_currently_congested else 0.0
+        self._update_internal_significance(penalty)
+
+        # 3. Standard Removal Logic (Copied from V2)
+        am_executing = (self.agent.status == 'EXECUTING' and self.agent.current_target_task_id is not None)
+        executing_tid = self.agent.current_target_task_id if am_executing else -1
+        
+        to_remove = []
+        temp_sequence = self.tasks_sequence_list.copy()
+
+        for tid in temp_sequence:
+            if tid == executing_tid: 
+                continue
+
+            # Reason 1: Lost Ownership
+            if self.assigned_agent_list[tid] != self.agent_id:
+                to_remove.append((tid, "PASSIVE_LOST_OWNERSHIP"))
+                continue
+            
+            # Reason 2: Constraint Violation (Deadline)
+            # Note: _calculate_significance uses _calculate_total_path_cost which returns INF on violation
+            real_sig = self._calculate_significance(self.all_tasks[tid])
+            if math.isinf(real_sig):
+                to_remove.append((tid, "ACTIVE_CONSTRAINT_VIOLATION"))
+                continue
+
+            # Reason 3: Congestion Pruning
+            if self._is_currently_congested:
+                to_remove.append((tid, "CONGESTION_AVOIDANCE"))
+
+        # Execute Removal
+        for tid, reason in to_remove:
+            if tid in self.tasks_sequence_list:
+                self.tasks_sequence_list.remove(tid)
+                
+                if reason == "PASSIVE_LOST_OWNERSHIP":
+                     self.blacklist[tid] = self.current_time + self.PASSIVE_COOLING_DURATION
+                elif reason == "CONGESTION_AVOIDANCE":
+                     self.blacklist[tid] = self.current_time + 5.0
+
+            # Reset internal state
+            if not self.all_tasks[tid].completed and self.assigned_agent_list[tid] == self.agent_id:
+                self.assigned_agent_list[tid] = -1
+                self.significance_list[tid] = INFINITY
+                self.task_timestamps[tid] = self.current_time
+                self.blacklist[tid] = self.current_time + self.BLACKLIST_DURATION
+
+    # *******************************************************
+    # Optimization Logic (V3 Specific)
+    # *******************************************************
+
+    def _optimize_path_with_pinned_2opt(self) -> None:
+        """
+        Applies 2-Opt Local Search while pinning the active target.
+        """
+        # [Fix] Ensure agent is bound
+        assert self.agent is not None
+
+        path = self.tasks_sequence_list
+        n = len(path)
+        if n < 3: 
+            return
+
+        # Pinning Logic
+        start_index = 0
+        if self.agent.status != 'IDLE' and self.agent.current_target_task_id is not None:
+            if path and path[0] == self.agent.current_target_task_id:
+                start_index = 1
+        
+        if n - start_index < 2: 
+            return
+
+        improved = True
+        while improved:
+            improved = False
+            for i in range(start_index, n - 1):
+                for j in range(i + 1, n):
+                    new_path = path[:i] + path[i:j+1][::-1] + path[j+1:]
+                    
+                    current_cost = self._calculate_total_path_cost(path)
+                    new_cost = self._calculate_total_path_cost(new_path)
+
+                    if new_cost < current_cost and not math.isinf(new_cost):
+                        # Safety check for feasibility
+                        if self._is_path_feasible(new_path):
+                            path = new_path
+                            self.tasks_sequence_list = new_path
+                            improved = True
+                            break 
+                if improved: 
+                    break
+
+    def _is_path_feasible(self, path: List[int]) -> bool:
+        # [Fix] Ensure agent is bound
+        assert self.agent is not None
+
+        curr_pos = self.agent.position
+        curr_time = self.current_time
+        for tid in path:
+            task = self.all_tasks[tid]
+            dist = np.linalg.norm(task.position - curr_pos)
+            arrival = curr_time + (dist / self.agent.speed)
+            if arrival > task.deadline: 
+                return False
+            curr_time = arrival + task.exec_duration
+            curr_pos = task.position
+        return True
+
+    # *******************************************************
+    # Helpers (Maintenance & Congestion)
+    # *******************************************************
+
+    def _calculate_congestion_status(self, messages: List[Dict]) -> bool:
+        # [Fix] Ensure agent is bound
+        assert self.agent is not None
+
+        my_pos = self.agent.position
+        for msg in messages:
+            n_id = msg['sender_id']
+            n_pos = msg.get('sender_position')
+            if n_pos is not None:
+                dist = np.linalg.norm(my_pos - n_pos)
+                # Congested if close to a higher priority (lower ID) agent
+                if dist < self.CONGESTION_RADIUS and n_id < self.agent_id:
+                    return True
+        return False
+
+    def _check_stale_information(self) -> None:
+        for tid in range(len(self.all_tasks)):
+            if self.all_tasks[tid].completed: 
+                continue
+            if self.assigned_agent_list[tid] == self.agent_id: 
+                continue
+            if self.assigned_agent_list[tid] == -1: 
+                continue
+            if self.significance_list[tid] == self.HARD_LOCK_SIG: 
+                continue
+
+            if (self.current_time - self.task_timestamps[tid]) > self.STALE_TIMEOUT:
+                self.assigned_agent_list[tid] = -1
+                self.significance_list[tid] = INFINITY
+                self.task_timestamps[tid] = self.current_time
+                if tid in self.known_execution_locks:
+                    del self.known_execution_locks[tid]
+
+    def _cleanup_blacklist(self) -> None:
+        expired = [tid for tid, expiry in self.blacklist.items() if self.current_time >= expiry]
+        for tid in expired:
+            del self.blacklist[tid]
+    
+    def _update_internal_significance(self, penalty: float) -> None:
+        """Helper to update local bids after path changes."""
+        for tid in self.tasks_sequence_list:
+            new_sig = self._calculate_significance(self.all_tasks[tid])
+            if self._is_currently_congested: 
+                new_sig += penalty
+            if abs(new_sig - self.significance_list[tid]) > 1e-6:
+                self.significance_list[tid] = new_sig
+
+    # *******************************************************
+    # Cost Calculations (Robust V2 Version)
+    # *******************************************************
+
+    def _calculate_total_path_cost(self, path: List[int]) -> float:
+        """
+        Calculates cost with STRICT Deadline constraints. 
+        Returns INFINITY if any deadline is violated.
+        """
+        # [Fix] Use explicit None check so type checker knows it's safe afterwards
+        if self.agent is None: 
+            return INFINITY
+
+        cost = 0.0
+        curr_pos = self.agent.position
+        current_arrival_time = self.current_time 
+
+        for tid in path:
+            task = self.all_tasks[tid]
+            dist = np.linalg.norm(task.position - curr_pos)
+            travel_time = dist / self.agent.speed
+            
+            current_arrival_time += travel_time
+            if current_arrival_time > task.deadline:
+                return INFINITY
+
+            cost += travel_time + task.exec_duration
+            current_arrival_time += task.exec_duration
+            curr_pos = task.position
+
+        return cost
+
+    def _calculate_significance(self, task: Task) -> float:
+        if task.id not in self.tasks_sequence_list: 
+            return INFINITY
+        
+        cost_with = self._calculate_total_path_cost(self.tasks_sequence_list)
+        
+        # If path is invalid, significance is compromised (return INF to trigger removal)
+        if math.isinf(cost_with):
+            return INFINITY
+
+        temp = self.tasks_sequence_list.copy()
+        temp.remove(task.id)
+        cost_without = self._calculate_total_path_cost(temp)
+        
+        return cost_with - cost_without
+
+    def _calculate_marginal_significance(self, task: Task) -> Tuple[float, int]:
+        min_marginal = INFINITY
+        best_pos = -1
+        base_cost = self._calculate_total_path_cost(self.tasks_sequence_list)
+        
+        # If base path is already broken, we can't add anything
+        if math.isinf(base_cost) and len(self.tasks_sequence_list) > 0:
+             return INFINITY, -1
+
+        for i in range(len(self.tasks_sequence_list) + 1):
+            temp = self.tasks_sequence_list.copy()
+            temp.insert(i, task.id)
+            new_cost = self._calculate_total_path_cost(temp)
+            
+            if math.isinf(new_cost):
+                continue
+
+            marginal = new_cost - base_cost
+            if marginal < min_marginal:
+                min_marginal = marginal
+                best_pos = i
+        return min_marginal, best_pos
+
+    def _calculate_reach_time(self, task_id: int, pos: int) -> float:
+        # [Fix] Ensure agent is bound
+        assert self.agent is not None
+
+        cost = 0.0
+        curr_pos = self.agent.position
+        for tid in self.tasks_sequence_list[:pos]:
+            t = self.all_tasks[tid]
+            cost += np.linalg.norm(t.position - curr_pos) / self.agent.speed + t.exec_duration
+            curr_pos = t.position
+        target = self.all_tasks[task_id]
+        return cost + np.linalg.norm(target.position - curr_pos) / self.agent.speed
+
+##### END FILE: ./algorithms/dynamic_pi.py #####
+
+##### FILE: ./algorithms/factory.py #####
+
+# --------------------------------------------------------
+# File: algorithms/factory.py
+# Implement using the factory pattern, defining an 
+# interface for creating various specific algorithms.
+# --------------------------------------------------------
+
+# The feature implementation is correct fine.
+
+from algorithms.base import BaseAlgorithm
+from algorithms.original_pi import OriginalPI
+from algorithms.dynamic_pi import DynamicPI
+from typing import List
+from core.task import Task
+
+class AlgorithmFactory:
+    """
+    Factory class to instantiate algorithms based on a string key.
+    """
+
+    @staticmethod
+    def create(algo_name: str, agent_id: int, max_tasks: int, all_tasks: List[Task]) -> BaseAlgorithm:
+        """
+        Creates an instance of the requested algorithm strategy.
+
+        Args:
+            algo_name: Name key ('original', 'v1', 'v2', 'v3').
+            agent_id: The agent's ID.
+            max_tasks: Capacity constraint.
+            all_tasks: Global task list.
+
+        Returns:
+            An initialized instance of a BaseAlgorithm subclass.
+        """
+        if algo_name == "original":
+            return OriginalPI(agent_id, max_tasks, all_tasks)
+        elif algo_name == "dynamic":
+            return DynamicPI(agent_id, max_tasks, all_tasks)
+        else:
+            raise ValueError(f"Unknown algorithm name: {algo_name}")
+
+##### END FILE: ./algorithms/factory.py #####
+
+
+##### FILE: ./algorithms/original_pi.py #####
+
+# --------------------------------------------------------
+# File: algorithms/original_pi.py
+# Implemented PI-Avg. based on the paper.
+# --------------------------------------------------------
+
+import numpy as np
+import math
+from typing import List, Dict, Any, Tuple
+from algorithms.base import BaseAlgorithm
+from core.agent import Agent
+from core.task import Task
+
+# Use positive infinity for initial cost values
+INFINITY = float('inf')
+
+class OriginalPI(BaseAlgorithm):
+    """
+    Implements the original PI Algo.
+
+    This class provides the core logic for the Performance Impact (PI) algorithm,
+    which is a distributed task allocation method based on market-based auctions.
+    It iterates through three phases: Task Inclusion, Consensus, and Task Removal.
+
+    References:
+        Zhao et al., "A Heuristic Distributed Task Allocation Method for Multivehicle
+        Multitask Problems and Its Application to Search and Rescue Scenario",
+        [cite_start]IEEE Transactions on Cybernetics, 2016. [cite: 3]
+
+    Features:
+        - Uses Vector Clocks (`timestamp_list`) for consensus to resolve conflicts.
+        - Designed primarily for static allocation phases where agents reach.
+          consensus before execution.
+        - Implements the iterative greedy removal strategy for handling task synergies.
+    """
+
+    def __init__(self, agent_id: int, max_tasks: int, all_tasks: List[Task]) -> None:
+        """
+        Initializes the PI algorithm state.
+
+        Args:
+            agent_id: The unique ID of the agent running this algorithm.
+            max_tasks: The maximum number of tasks this agent can carry.
+            all_tasks: A reference list of all available tasks in the environment.
+        """
+        super().__init__(agent_id, max_tasks, all_tasks)
+
+        num_tasks = len(all_tasks)
+        
+        # --- PI Algorithm State ---
+        # a: The current sequence of tasks assigned to the agent
+        self.tasks_sequence_list: List[int] = []
+        # γ: The significance list
+        self.significance_list: List[float] = [INFINITY] * num_tasks
+        # γ*: The marginal significance list
+        self.marginal_significance_list: List[float] = [0.0] * num_tasks
+        # β: The assigned list
+        self.assigned_agent_list: List[int] = [-1] * num_tasks
+        
+        # --- Consensus State ---
+        # δ: the timestamp list
+        self.timestamp_list: List[float] = [] 
+        # Reference to the physical agent
+        self.agent: Any = None  
+        # Iteration step
+        self.current_time = 0.0
+        
+    def bind_agent(self, agent: Agent):
+        """
+        Binds the physical agent instance to the algorithm.
+
+        This allows the algorithm to access the agent's current position and speed
+        for cost calculations.
+
+        Args:
+            agent: The physical Agent instance.
+        """
+        self.agent = agent
+    
+    def finalize_setup(self, feasibility_matrix: List[List[bool]]) -> None:
+        """
+        Performs second-stage initialization with global information.
+
+        Args:
+            feasibility_matrix: A boolean matrix where M[i][j] indicates if 
+                                agent i can execute task j.
+        """
+        self.feasibility_matrix = feasibility_matrix
+        num_agents = len(feasibility_matrix)
+        # Initialize vector clock with zeros for all known agents
+        self.timestamp_list = [0.0] * num_agents
+
+    def get_plan(self) -> List[int]:
+        """
+        Returns the current planned sequence of tasks.
+        """
+        return self.tasks_sequence_list
+
+    def pack_message(self) -> Dict[str, Any]:
+        """
+        Packs the internal state into a dictionary for broadcasting.
+
+        Returns:
+            A dictionary containing:
+                - sender_id: ID of this agent.
+                - significance_list: The list of bids.
+                - assigned_agent_list: The list of task owners.
+                - timestamp_list: The vector clock.
+        """
+        return {
+            "sender_id": self.agent_id,
+            "significance_list": self.significance_list,
+            "assigned_agent_list": self.assigned_agent_list,
+            "timestamp_list": self.timestamp_list
+        }
+
+    def on_task_completed(self, task_id: int) -> None:
+        """
+        Callback handler for when a task is physically completed.
+
+        Removes the completed task from the internal sequence to prevent re-execution
+        and potential infinite loops during the execution phase.
+
+        Args:
+            task_id: The ID of the completed task.
+        """
+        if task_id in self.tasks_sequence_list:
+            self.tasks_sequence_list.remove(task_id)
+
+    def run_iteration(self, messages: List[Dict[str, Any]]) -> None:
+        """
+        Executes one complete iteration of the PI algorithm.
+
+        The iteration consists of three phases:
+            1. Inclusion: greedily add tasks that reduce local cost.
+            2. Consensus: resolve conflicts with neighbors based on bids.
+            3. Removal: remove tasks that are no longer valid or optimal.
+
+        Args:
+            messages: A list of messages received from neighboring agents.
+        """
+        # --- 1. Tasks Inclusion ---
+        self._task_inclusion_phase()
+        
+        # --- 2. Information Consensus ---
+        self._consensus_phase(messages)
+        
+        # --- 3. Tasks Removal ---
+        self._task_removal_phase()
+
+        # Update local clock
+        self.current_time += 1.0
+        if self.timestamp_list:
+            self.timestamp_list[self.agent_id] = self.current_time
+
+    # ******************************* 
+    # Phase Implementations
+    # ******************************* 
+    def _task_inclusion_phase(self) -> None:
+        """
+        Greedily adds tasks to the bundle.
+
+        Iteratively finds the best unassigned task that maximizes the bid improvement
+        (difference between current network bid and my marginal cost) and inserts it
+        into the best position in the path.
+        """
+        while len(self.tasks_sequence_list) < self.max_tasks:
+            max_diff = -1.0
+            best_task = -1
+            best_pos = -1
+
+            for task in self.all_tasks:
+                # Skip if already in my list
+                if task.id in self.tasks_sequence_list: 
+                    continue
+                # Skip if I cannot physically perform this task type
+                if not self.feasibility_matrix[self.agent_id][task.id]: 
+                    continue
+
+                # Calculate cost to insert this task
+                marginal, pos = self._calculate_marginal_significance(task)
+                
+                # Check constraint 5: Deadline
+                if self._calculate_reach_time(task.id, pos) >= task.deadline:
+                    continue
+
+                # Store the marginal significance
+                self.marginal_significance_list[task.id] = marginal
+
+                # Calculate potential gain
+                # Find the task that maximizes cost reduction
+                diff = self.significance_list[task.id] - marginal
+
+                if diff > max_diff:
+                    max_diff = diff
+                    best_task = task.id
+                    best_pos = pos
+
+            # If an optimizable task is found, add it to the task list
+            if max_diff > 0:
+                self.tasks_sequence_list.insert(best_pos, best_task)
+                self.significance_list[best_task] = self.marginal_significance_list[best_task]
+                self.assigned_agent_list[best_task] = self.agent_id
+            else:
+                # No more tasks can be added profitably
+                break
+
+        # Cascade Update: Adding a task changes costs for all tasks in the path
+        # We must update the significance values for all owned tasks
+        for tid in self.tasks_sequence_list:
+            self.significance_list[tid] = self._calculate_significance(self.all_tasks[tid])
+
+    def _consensus_phase(self, messages: List[Dict]) -> None:
+        """
+        Resolves conflicts by comparing bids with neighbors.
+
+        Uses standard consensus rules:
+            1. Update vector clock to max values.
+            2. Compare bids (significance). Lower bid (cost) wins.
+            3. Use agent ID as tie-breaker.
+
+        Args:
+            messages: Incoming messages from neighbors.
+        """
+        for msg in messages:
+            neighbor_sig = msg['significance_list']
+            neighbor_assign = msg['assigned_agent_list']
+            neighbor_time = msg['timestamp_list']
+
+            # Update vector clock
+            for i in range(len(self.timestamp_list)):
+                self.timestamp_list[i] = max(self.timestamp_list[i], neighbor_time[i])
+            
+            # Update significance for each task
+            for tid in range(len(self.all_tasks)):
+                y_kj = neighbor_sig[tid]
+                z_kj = neighbor_assign[tid]
+                y_ij = self.significance_list[tid]
+                z_ij = self.assigned_agent_list[tid]
+                
+                # Update Rule: Adopt neighbor's info if their significance is better (lower)
+                if y_kj < y_ij:
+                    self.significance_list[tid] = y_kj
+                    self.assigned_agent_list[tid] = z_kj
+                # Tie-breaker: If significance are equal, lower Agent ID wins
+                elif math.isclose(y_kj, y_ij) and z_kj < z_ij:
+                    self.significance_list[tid] = y_kj
+                    self.assigned_agent_list[tid] = z_kj
+
+    def _task_removal_phase(self) -> None:
+        """
+        Removes tasks that are invalid or outbid.
+
+        Implements the Iterative Greedy Removal strategy proposed in Zhao et al. (2016).
+        Instead of removing all invalid tasks at once, it iteratively removes the task
+        whose removal causes the least "loss" (or most "gain"), re-evaluating synergies
+        after each removal.
+        """
+        # --- 1. Identify the initial set of tasks that MUST be checked for removal ---
+        tasks_to_check_for_removal = {
+            task_id
+            for task_id in self.tasks_sequence_list
+            if self.assigned_agent_list[task_id] != self.agent.id
+        }
+
+        # --- 2. Iteratively remove tasks until the set is clean ---
+        while tasks_to_check_for_removal:
+            max_reduction = -INFINITY
+            task_to_remove = -1
+            # Evaluate which removal is "best"
+            # Find the task whose removal can maximize improvement (reduction) in cost
+            for task_id in tasks_to_check_for_removal:
+                current_significance = self._calculate_significance(self.all_tasks[task_id])
+                global_significance = self.significance_list[task_id]
+
+                reduction = current_significance - global_significance
+                if reduction > max_reduction:
+                    max_reduction = reduction
+                    task_to_remove = task_id
+            
+            # --- 3. Execute removal ---
+            if max_reduction > 0:
+                self.tasks_sequence_list.remove(task_to_remove)
+                tasks_to_check_for_removal.remove(task_to_remove)
+            else:
+                break 
+
+    # ********************************** 
+    # Math Helpers (Cost Calculation)
+    # ********************************** 
+    def _calculate_total_path_cost(self, path: List[int]) -> float:
+        """
+        Calculates the total time cost to execute a sequence of tasks.
+
+        Args:
+            path: A list of task IDs representing the execution order.
+
+        Returns:
+            Total time (travel + execution) in seconds. Returns INFINITY if agent is unbound.
+        """
+
+        # Safety check: Ensure agent is bound
+        if not self.agent:
+            return INFINITY
+
+        cost = 0.0
+        curr_pos = self.agent.position
+        for tid in path:
+            task = self.all_tasks[tid]
+            dist = np.linalg.norm(task.position - curr_pos)
+            cost += dist / self.agent.speed + task.exec_duration
+            curr_pos = task.position
+        return cost
+
+    def _calculate_significance(self, task: Task) -> float:
+        """
+        Calculates the significance (marginal cost contribution) of a task.
+
+        Significance is defined as: Cost(Path) - Cost(Path without task).
+
+        Args:
+            task: The task object to evaluate.
+
+        Returns:
+            The marginal cost value. Returns INFINITY if task is not in the list.
+        """
+        if task.id not in self.tasks_sequence_list: 
+            return INFINITY
+
+        cost_with = self._calculate_total_path_cost(self.tasks_sequence_list)
+
+        temp = self.tasks_sequence_list.copy()
+        temp.remove(task.id)
+        cost_without = self._calculate_total_path_cost(temp)
+        return cost_with - cost_without
+
+    def _calculate_marginal_significance(self, task: Task) -> Tuple[float, int]:
+        """
+        Finds the best insertion position and cost for a new task.
+
+        Iterates through all possible insertion points in the current path
+        to find the one that minimizes the increase in total cost.
+
+        Args:
+            task: The new task to consider adding.
+
+        Returns:
+            A tuple (min_marginal_cost, best_insertion_index).
+        """
+        min_marginal = INFINITY
+        best_pos = -1
+        base_cost = self._calculate_total_path_cost(self.tasks_sequence_list)
+        
+        for i in range(len(self.tasks_sequence_list) + 1):
+            temp = self.tasks_sequence_list.copy()
+            temp.insert(i, task.id)
+            new_cost = self._calculate_total_path_cost(temp)
+            marginal = new_cost - base_cost
+            if marginal < min_marginal:
+                min_marginal = marginal
+                best_pos = i
+        return min_marginal, best_pos
+
+    def _calculate_reach_time(self, task_id: int, pos: int) -> float:
+        """
+        Calculates the arrival time at a specific task.
+
+        Used to check deadline constraints.
+
+        Args:
+            task_id: The ID of the target task.
+            pos: The proposed insertion index in the path.
+
+        Returns:
+            The simulation time when the agent would arrive at the task.
+        """
+        # Safety check: Ensure agent is bound
+        if not self.agent:
+            return INFINITY
+
+        cost = 0.0
+        curr_pos = self.agent.position
+
+        # Calculate time to traverse the path up to the insertion point
+        for tid in self.tasks_sequence_list[:pos]:
+            t = self.all_tasks[tid]
+            cost += np.linalg.norm(t.position - curr_pos) / self.agent.speed + t.exec_duration
+            curr_pos = t.position
+
+        # Add travel time to the target task itself
+        target = self.all_tasks[task_id]
+        return cost + np.linalg.norm(target.position - curr_pos) / self.agent.speed
+
+##### END FILE: ./algorithms/original_pi.py #####
+
+##### FILE: ./core/agent.py #####
+
+# --------------------------------------------------------
+# File: core/agent.py
+# Implemented the Agent entity in the simulation, 
+# where each Agent is equipped with a decision-making 
+# module for task assignment.
+# --------------------------------------------------------
+
+# The feature implementation is correct fine.
+
+import numpy as np
+from typing import Dict, List
+from algorithms.base import BaseAlgorithm
+from core.task import Task
+
+# Define agent type constants
+AGENT_TYPE_MEDICINE = 'medicine'
+AGENT_TYPE_FOOD     = 'food'
+
+class Agent:
+    """
+    Represents an agent in the simulation.
+
+    The Agent is responsible for physical movement, state maintenance, and
+    delegating decision-making to an injected algorithm strategy.
+
+    Attributes:
+        id (int): Unique identifier.
+        agent_type (str): Type of the agent (e.g., 'medicine', 'food').
+        position (np.ndarray): Current (x, y) coordinates.
+        speed (float): Movement speed in units per second.
+        color (Tuple): RGB color for visualization.
+        algorithm (BaseAlgorithm): The decision-making strategy instance.
+        status (str): Current physical status ('IDLE', 'MOVING', 'EXECUTING').
+        completed_tasks_log (List[int]): History of completed task IDs.
+    """
+
+    def __init__(self, id: int, agent_type: str, position: tuple, speed: float,
+                 color: tuple, algorithm: BaseAlgorithm) -> None:
+        """
+        Initializes the Agent.
+
+        Args:
+            id: Agent ID.
+            agent_type: Type string.
+            position: Initial (x, y) tuple.
+            speed: Movement speed.
+            color: Visualization color.
+            algorithm: An instance of a subclass of BaseAlgorithm.
+        """
+        # Basic attribute
+        self.id = id
+        self.agent_type = agent_type
+        self.position = np.array(position, dtype=float)
+        self.speed = speed
+        
+        # Decision-Making module
+        self.algorithm = algorithm
+        self.algorithm.bind_agent(self)
+
+        # Physical state
+        self.color = color
+        self.status = 'IDLE'
+        self.current_target_task_id: int | None = None
+        self.time_at_task = 0.0
+        self.completed_tasks_log: List[int] = []
+
+        # Statistic distance
+        self.total_distance: float = 0.0
+
+    def __repr__(self) -> str:
+        return f"Agent(id={self.id}, type={self.agent_type}, pos={self.position})"
+
+    def update_state(self, dt: float, all_tasks: List[Task]) -> None:
+        """
+        Updates the agent's physical state for one time step.
+
+        Moves towards the first task in the algorithm's plan. Handles task
+        locking and completion logic.
+
+        Args:
+            dt: Time step duration.
+            all_tasks: List of all Task objects (for position/status lookup).
+        """
+        # --- 1. Get current plan from the algorithm ---
+        current_plan = self.algorithm.get_plan()
+
+        # Filter out completed tasks from the plan
+        # This prevent the agent from moving towards a tasks that is already done
+        while current_plan:
+            target_id = current_plan[0]
+            if all_tasks[target_id].completed:
+                # Notify algo to cleanup this stale task from its plan
+                self.algorithm.on_task_completed(target_id)
+                # Re-fetch plan after update
+                current_plan = self.algorithm.get_plan()
+                continue
+            break
+            
+        # If no vaild tasks, become 'IDLE'
+        if not current_plan:
+            self.status = 'IDLE'
+            self.current_target_task_id = None
+            return
+        
+        # --- 2. Determine target task ---
+        target_task_id = current_plan[0]
+        target_task = all_tasks[target_task_id]
+        self.current_target_task_id = target_task_id
+        
+        # --- 3. Movement logic ---
+        dist_to_target = np.linalg.norm(target_task.position - self.position)
+        move_dist = self.speed * dt
+
+        # Case A: En route
+        if dist_to_target > move_dist and self.status != 'EXECUTING':
+            self.status = 'MOVING'
+            # Calculate the direction vector (uint vector)
+            direction = (target_task.position - self.position) / dist_to_target
+            # Updates position infomation
+            self.position += direction * move_dist
+            # Cumulative moving distance is used for subsequent statistics
+            self.total_distance += move_dist   
+
+        # Case B: Arrived / Executing
+        else:
+            if self.status != 'EXECUTING':
+                # Just arrived
+                # Cumulative moving distance is used for subsequent statistics
+                self.total_distance += move_dist    
+                self.status = 'EXECUTING'
+                self.position = target_task.position
+                self.time_at_task = 0.0
+                # Notify algo to lock this task (prevent others from taking it)
+                self.algorithm.on_task_locked(target_task_id)
+
+            # Execute task
+            self.time_at_task += dt
+            if self.time_at_task >= target_task.exec_duration:
+                self._complete_task(target_task)
+    
+    def run_algorithm_step(self, messages: List[Dict]) -> None:
+        """
+        Delegates the decision-making step to the algorithm strategy.
+        """
+        self.algorithm.run_iteration(messages)
+
+    def prepare_message(self) -> Dict:
+        """
+        Delegates message packaging to the algorithm strategy.
+        """
+        return self.algorithm.pack_message()
+
+    def is_idle(self) -> bool:
+        """
+        Checks if the agent has no active tasks and is not executing.
+        """
+        return self.status == 'IDLE' and not self.algorithm.get_plan()
+
+    def _complete_task(self, task: Task) -> None:
+        """
+        Internal handler for task completion.
+        """
+        if not task.completed:
+            print(f"Agent {self.id} finished Task {task.id}")
+            task.completed = True
+            self.completed_tasks_log.append(task.id)
+            # Notify algorithm to update internal state (remove task, update bids)
+            self.algorithm.on_task_completed(task.id)
+
+        self.status = 'IDLE'
+        self.time_at_task = 0.0
+
+##### END FILE: ./core/agent.py #####
+
+##### FILE: ./core/environment.py #####
+
+# --------------------------------------------------------
+# File: core/environment.py
+# The environment for executing the simulation includes 
+# agents, tasks, topology, and other components.
+# --------------------------------------------------------
+
+# The feature implementation is correct fine.
+
+import numpy as np
+from typing import Dict, List, Iterator, Any
+from collections import defaultdict
+from core.agent import Agent
+from core.task import Task
+from core.topology import Topology
+
+# Additional rounds of information transmission
+CONSENSUS_HOPS = 3
+
+class Environment:
+    """
+    Simulation environment managing agents, tasks, and the simulation loop.
+
+    This class acts as the central controller for the multi-agent system simulation.
+    It handles the initialization of entities, updates the network topology based on
+    agent positions, and drives the main simulation loops for both static and
+    dynamic allocation modes.
+
+    Attributes:
+        agents (List[Agent]): A list of all agent instances in the simulation.
+        tasks (List[Task]): A list of all task instances to be assigned or executed.
+        topology (Topology): The communication graph representing connectivity between agents.
+        communication_radius (float): The maximum distance between two agents to establish
+            a communication link.
+        fixed_topology (bool): If True, the topology will not be updated based on distance.
+    """
+    def __init__(self, agents: List[Agent], tasks: List[Task],
+                 topology: Topology, communication_radius: float,
+                 fixed_topology: bool = False) -> None:
+        """
+        Initializes the simulation environment.
+
+        Args:
+            agents: A list of Agent objects.
+            tasks: A list of Task objects.
+            topology: A Topology object managing the communication graph.
+            communication_radius: The maximum distance between agents to allow communication.
+            fixed_topology: If True, the topology will not be updated based on distance.
+        """
+        self.agents = agents
+        self.tasks = tasks
+        self.topology = topology
+        self.communication_radius = communication_radius
+        self.fixed_topology = fixed_topology  
+
+    # *****************************************
+    # Mode 1: Dynamic Simulation (For V1, V2)
+    # *****************************************
+    def run_dynamic_simulation(self, dt: float, max_time: float) -> Iterator[Dict[str, Any]]:
+        """
+        Runs a unified simulation loop where allocation and execution happen simultaneously.
+
+        This mode simulates a dynamic environment where agents move, communicate,
+        and execute tasks in real-time. It is suitable for algorithms like V1 and V2
+        that support dynamic reallocation.
+
+        Args:
+            dt: The time step duration for the simulation in seconds.
+            max_time: The maximum duration to run the simulation in seconds.
+
+        Yields:
+            Dict[str, Any]: A dictionary containing the current snapshot of the system state.
+                Keys include 'agents', 'tasks', 'topology', 'time', and 'iteration'.
+        """
+        # Current simulation time
+        current_time = 0.0
+
+        # Ensure initial 'IDLE' state
+        for agent in self.agents:
+            agent.status = 'IDLE'
+
+        # Initializes communication topology
+        self._update_dynamic_topology()
+
+        # Loop
+        while current_time < max_time:
+            # --- 1. Update topology ---
+            self._update_dynamic_topology()
+
+            # --- 2. Run algorithm ---
+            # Let the information circulate a little longer
+            for _ in range(CONSENSUS_HOPS):
+                self._run_communication_step()
+
+            # --- 3. Physics update ---
+            all_idle = True
+            for agent in self.agents:
+                agent.update_state(dt, self.tasks)
+                if not agent.is_idle():
+                    all_idle = False
+            
+            # --- 4. Termination check ---
+            incomplete_tasks = [t for t in self.tasks if not t.completed]
+            
+            # Case A: All tasks are completed, and all agents are in an idle state
+            if not incomplete_tasks:
+                if all_idle:
+                    print(f"\n[Success] All tasks completed at {current_time:.2f}s")
+                    self._print_final_log()
+                    yield self.get_current_state(current_time)
+                    break
+            # Case B: All agents are in an idle state, but there are unfinished tasks
+            elif all_idle:
+                # If everyone is idle but tasks remain, it's a deadlock (impossible tasks)
+                print(f"\n[Terminated] Deadlock detected at {current_time:.2f}s. "
+                      f"{len(incomplete_tasks)} tasks remaining.")
+                self._print_final_log()
+                yield self.get_current_state(current_time)
+                break
+
+            # --- 5. Yield state for amination ---
+            yield self.get_current_state(current_time)
+            current_time += dt
+
+    # *****************************************
+    # Mode 2: Static Allocation (For PI - Phase 1)
+    # *****************************************
+    def run_static_allocation(self, max_iterations: int, convergence_threshold: int = 10) -> Iterator[Dict[str, Any]]:
+        """
+        Runs only the allocation algorithm without physical movement (Phase 1).
+
+        This mode is specific to the original PI algorithm's first phase, where agents
+        negotiate task assignments until consensus is reached or the iteration limit is hit.
+        Agents do not move during this phase.
+
+        Args:
+            max_iterations: The maximum number of algorithm iterations to run.
+            convergence_threshold: The number of consecutive stable iterations required
+                to consider the allocation converged.
+
+        Yields:
+            Dict[str, Any]: A dictionary containing the current snapshot of the system state
+                for visualization.
+        """
+        print("--- Phase 1: Static Task Allocation ---")
+
+        # Initial topology calculation (Static)
+        if self.topology.graph.number_of_edges() == 0:
+             self._update_dynamic_topology()
+
+        last_plan_signature = None
+        stable_count = 0
+
+        for i in range(max_iterations):
+            # Run communication and decision making
+            self._run_communication_step()
+
+            # Check convergence
+            # We construct a signature of all agents' plans to detect stability
+            current_plans = tuple(tuple(a.algorithm.get_plan()) for a in self.agents)
+            
+            if current_plans == last_plan_signature:
+                stable_count += 1
+            else:
+                stable_count = 0
+            last_plan_signature = current_plans
+
+            yield self.get_current_state(iteration=i)
+
+            if stable_count >= convergence_threshold:
+                print(f"Allocation converged after {i+1} iterations.")
+                break
+        else:
+            print(f"Allocation stopped after max {max_iterations} iterations.")
+
+    # *****************************************
+    # Mode 2: Static Execution (For PI - Phase 2)
+    # *****************************************
+    def run_static_execution(self, dt: float, max_time: float) -> Iterator[Dict[str, Any]]:
+        """
+        Runs physical execution based on pre-calculated plans (Phase 2).
+
+        This mode follows the static allocation phase. Agents execute their assigned
+        tasks without further negotiation. The simulation ends when all reachable tasks
+        are completed.
+
+        Args:
+            dt: The time step duration for the simulation in seconds.
+            max_time: The maximum duration to run the simulation in seconds.
+
+        Yields:
+            Dict[str, Any]: A dictionary containing the current snapshot of the system state.
+        """
+        print("\n--- Phase 2: Mission Execution ---")
+        current_time = 0.0
+
+        # Loop
+        while current_time < max_time:
+            # Physics update only
+            all_agents_idle = True
+            for agent in self.agents:
+                agent.update_state(dt, self.tasks)
+                if not agent.is_idle():
+                    all_agents_idle = False
+
+            # Check if finished
+            if all_agents_idle:
+                completed_count = sum(1 for t in self.tasks if t.completed)
+                total_count = len(self.tasks)
+                if completed_count == total_count:
+                    print(f"[Success] All tasks completed at {current_time:.2f}s")
+                else:
+                    print(f"\n[Terminated] Deadlock detected at {current_time:.2f}s. "
+                      f"{total_count - completed_count}  tasks remaining.")
+
+                # Print informations
+                self._print_final_log()
+                yield self.get_current_state(current_time)
+                break
+            # Yields state for animation
+            yield self.get_current_state(current_time)
+            current_time += dt
+    
+    # *****************************************
+    # Helpers
+    # *****************************************
+    def _run_communication_step(self) -> None:
+        """
+        Executes one round of message exchange and algorithm updates.
+
+        This helper method performs three steps:
+        1. Collects messages prepared by all agents.
+        2. Routes messages to neighbors based on the current topology.
+        3. Triggers the algorithm step for each agent to process received messages.
+        """
+        # --- 1. Prepare messages for neighbors ---
+        prepare_msgs = [agent.prepare_message() for agent in self.agents]
+        
+        # --- 2. Route messages to neighbors ---
+        inbox = defaultdict(list)
+        for sender in self.agents:
+            neighbors = self.topology.get_neighbors(sender.id)
+            for nid in neighbors:
+                inbox[nid].append(prepare_msgs[sender.id])
+
+        # --- 3. Process messages from neighbors ---
+        for agent in self.agents:
+            agent.run_algorithm_step(inbox[agent.id])
+
+    def _update_dynamic_topology(self) -> None:
+        """
+        Recalculates the communication graph based on current agent positions.
+
+        It computes the pairwise distances between all agents. If the distance
+        is within `communication_radius`, a link is added to the adjacency matrix.
+        The topology object is then updated with this new matrix.
+
+        If `fixed_topology` is True, this method does nothing, preserving the
+        manually initialized network structure.
+        """
+        # For original PI
+        if self.fixed_topology:
+            return
+
+        # We delegate the graph building to the Topology class, 
+        # but we need to provide the adjacency matrix logic here
+        num_agents = len(self.agents)
+        adj_matrix = [[False] * num_agents for _ in range(num_agents)]
+        
+        for i in range(num_agents):
+            for j in range(i + 1, num_agents):
+                dist = np.linalg.norm(self.agents[i].position - self.agents[j].position)
+                if dist <= self.communication_radius:
+                    adj_matrix[i][j] = True
+                    adj_matrix[j][i] = True
+
+        self.topology.update_from_adjacency_matrix(adj_matrix)
+
+    def get_current_state(self, time: float = 0.0, iteration: int = 0) -> Dict[str, Any]:
+        """
+        Captures the current snapshot of the simulation state.
+
+        Args:
+            time: The current simulation timestamp.
+            iteration: The current algorithm iteration count (for static mode).
+
+        Returns:
+            Dict[str, Any]: A dictionary containing references to agents, tasks,
+                topology, and current time/iteration metadata for visualization.
+        """
+        return {
+            "agents": self.agents,
+            "tasks": self.tasks,
+            "topology": self.topology,
+            "time": time,
+            "iteration": iteration
+        }
+
+    def _print_final_log(self):
+        """
+        Prints a summary log of tasks completed by each agent to the console.
+        """
+        print("-" * 40)
+        print("Final Execution Log:")
+        for agent in self.agents:
+            print(f"Agent {agent.id} ({agent.agent_type}) completed: {agent.completed_tasks_log}")
+        print("-" * 40)
+
+##### END FILE: ./core/environment.py #####
+
+
+##### FILE: ./core/task.py #####
+
+# --------------------------------------------------------
+# File: core/task.py
+# Implement the Task entity in the simulation.
+# --------------------------------------------------------
+
+# The feature implementation is correct fine.
+
+import numpy as np
+
+# Define task type constants
+TASK_TYPE_MEDICINE = 'medicine'
+TASK_TYPE_FOOD     = 'food'
+
+class Task:
+    """
+    Represents a task in the simulation enviroment.
+
+    Attributes:
+        id (int): Unique identifier for the task.
+        task_type (str): Type of the task (e.g., 'medicine', 'food').
+        position (np.ndarray): The (x, y) coordinates of the task.
+        deadline (float): The simulation time by which the task must be started.
+        exec_duration (float): The time required to complete the task once started.
+        completed (bool): Status flag indicating if the task has been finished.
+    """
+
+    def __init__(self, id: int, task_type: str, position: tuple,
+                 deadline: float, exec_duration: float) -> None:
+        """
+        Initializes a Task instance.
+
+        Args:
+            id: Unique identifier for the task.
+            task_type: Type string constant.
+            position: Tuple (x, y) for spatial coordinates.
+            deadline: Deadline timestamp.
+            exec_duration: Duration required to execute the task.
+        """
+        self.id = id
+        self.task_type = task_type
+        self.position = np.array(position, dtype=float)
+        self.deadline = deadline
+        self.exec_duration = exec_duration
+        self.completed = False
+
+    def __repr__(self) -> str:
+        pos_str = np.array2string(self.position, separator=',')
+        return (f"Task(id={self.id}, type='{self.task_type}', "
+                f"pos={pos_str}, deadline={self.deadline}, "
+                f"duration={self.exec_duration}, completed={self.completed})")
+    
+    def __str__(self) -> str:
+        return (f"Task #{self.id} ({self.task_type}) "
+                f"@ {self.position}, due={self.deadline:.1f}")
+
+##### END FILE: ./core/task.py #####
+
+##### FILE: ./core/topology.py #####
+
+# --------------------------------------------------------
+# File: algorithms/topology.py
+# Implement network communication in the simulation using 
+# the NetworkX library to achieve dynamic network changes.
+# --------------------------------------------------------
+
+# The feature implementation is correct fine.
+
+import networkx as nx
+from typing import List
+
+class Topology:
+    """
+    Manages the communication topology between agents using a graph structure.
+
+    Attributes:
+        graph (nx.Graph): NetworkX graph representing connectivity.
+    """
+
+    def __init__(self, agent_ids: List[int]) -> None:
+        """
+        Initializes the topology with a set of agent nodes.
+
+        Args:
+            agent_ids: A list of agent IDs to be added as nodes.
+        """
+        self.graph = nx.Graph()
+        self.graph.add_nodes_from(agent_ids)
+
+    def update_from_adjacency_matrix(self, adj_matrix: List[List[bool]]) -> None:
+        """
+        Rebuilds the graph edges based on an adjacency matrix.
+
+        Args:
+            adj_matrix: A square matrix where adj_matrix[i][j] is True if
+                        agents i and j are connected.
+        """
+        self.graph.clear_edges()
+        num_agents = len(adj_matrix)
+        for i in range(num_agents):
+            for j in range(i + 1, num_agents):
+                if adj_matrix[i][j]:
+                    self.graph.add_edge(i, j)
+
+    def is_connected(self) -> bool:
+        """
+        Checks if the entire graph is connected.
+
+        Returns:
+            True if the graph is connected, False otherwise.
+        """
+        if self.graph.number_of_nodes() == 0:
+            return True
+        return nx.is_connected(self.graph)
+    
+    def get_agent_count(self) -> int:
+        """
+        Returns the total number of agents in the topology.
+        """
+        return self.graph.number_of_nodes()
+
+    def get_neighbors(self, agent_id: int) -> List[int]:
+        """
+        Retrieves the IDs of neighbors connected to a specific agent.
+
+        Args:
+            agent_id: The ID of the agent query.
+
+        Returns:
+            A list of neighbor agent IDs. Returns an empty list if the agent
+            is not in the graph.
+        """
+        if agent_id not in self.graph:
+            return []
+        return list(self.graph.neighbors(agent_id))
+
+##### END FILE: ./core/topology.py #####
+
+##### FILE: ./main.py #####
+
+# ------------------------------
+# File: main.c
+# ------------------------------
+
+import re
+import os
+import sys
+import random
+import argparse
+import matplotlib.pyplot as plt
+from typing import Tuple, List, Dict
+
+from core.agent import Agent, AGENT_TYPE_MEDICINE, AGENT_TYPE_FOOD
+from core.task import Task, TASK_TYPE_MEDICINE, TASK_TYPE_FOOD
+from core.topology import Topology
+from core.environment import Environment
+from algorithms.factory import AlgorithmFactory
+from visualization.animator import Animator
+
+# Defaults
+NUM_AGENTS = 6 
+NUM_TASKS = 12 
+NETWORK = 'row'
+MAX_TASKS = 3
+MAX_TIME = 5000.0
+FIELD_SIZE = 2000.0
+MAX_ITER = 100
+RADIUS = 300.0 
+DT = 2.0 
+
+# ********************************** 
+# IO Helpers (Ported from V2)
+# ********************************** 
+def ensure_data_prefix(filename):
+    if not os.path.dirname(filename):
+        return os.path.join('data', filename)
+    else:
+        return filename
+
+def save_info_to_file(tasks: List[Task], agents: List[Agent], filename: str):
+    """
+    Saves the current simulation configuration to a text file.
+
+    Writes task and agent positions, deadlines, and execution durations to the
+    specified file path. This allows for reproducing specific random scenarios.
+
+    Args:
+        tasks: A list of Task objects present in the simulation.
+        agents: A list of Agent objects present in the simulation.
+        filename: The target file path to write the configuration to.
+
+    Raises:
+        IOError: If the file cannot be opened or written to.
+    """
+    try:
+        with open(filename, 'w') as f:
+            f.write('--- Tasks Info ---\n')
+            for task in tasks:
+                f.write(f"pos: ({task.position[0]}, {task.position[1]}), "
+                        f"deadline: {task.deadline}, "
+                        f"duration: {task.exec_duration}\n")
+
+            f.write('--- Agents Info ---\n')
+            for agent in agents:
+                f.write(f"pos: ({agent.position[0]}, {agent.position[1]})\n")
+        print(f"Successfully saved scenario to '{filename}'.")
+    except IOError as e:
+        print(f"Error saving file: {e}", file=sys.stderr)
+
+def load_info_from_file(filename: str) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Parses simulation configuration from a saved text file.
+
+    Reads a file generated by `save_info_to_file` and extracts task and agent
+    initialization parameters using regular expressions.
+
+    Args:
+        filename: The path to the configuration file.
+
+    Returns:
+        A tuple containing two lists:
+            - task_infos (List[Dict]): A list of dictionaries, each containing
+              'pos', 'deadline', and 'duration' for a task.
+            - agent_infos (List[Dict]): A list of dictionaries, each containing
+              'pos' for an agent.
+
+    Raises:
+        SystemExit: If the file cannot be found or read (exits the program).
+    """
+    task_infos = []
+    agent_infos = []
+    mode = ''
+    
+    # Regex patterns
+    task_pat = r'pos:\s*\(\s*(\d+\.?\d*),\s*(\d+\.?\d*)\s*\),\s*deadline:\s*(\d+\.?\d*),\s*duration:\s*(\d+\.?\d*)'
+    agent_pat = r'pos:\s*\(\s*(\d+\.?\d*),\s*(\d+\.?\d*)\s*\)'
+
+    try:
+        with open(filename, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line == "--- Tasks Info ---":
+                    mode = 'task'
+                    continue
+                elif line == "--- Agents Info ---":
+                    mode = 'agent'
+                    continue
+
+                if mode == 'task':
+                    m = re.search(task_pat, line)
+                    if m:
+                        task_infos.append({
+                            'pos': (float(m.group(1)), float(m.group(2))),
+                            'deadline': float(m.group(3)),
+                            'duration': float(m.group(4))
+                        })
+                elif mode == 'agent':
+                    m = re.search(agent_pat, line)
+                    if m:
+                        agent_infos.append({
+                            'pos': (float(m.group(1)), float(m.group(2)))
+                        })
+        print(f"Successfully loaded {len(task_infos)} tasks and {len(agent_infos)} agents from '{filename}'.")
+    except IOError as e:
+        print(f"Error loading file: {e}", file=sys.stderr)
+        sys.exit(1)
+        
+    return task_infos, agent_infos
+
+def setup_manual_network(adj_matrix: List[List[bool]], num_agents: int, net_type: str) -> None:
+    """
+    Sets up the adjacency matrix based on a fixed topology pattern.
+    """
+    if net_type == 'full':
+        for i in range(num_agents):
+            for j in range(i + 1, num_agents):
+                adj_matrix[i][j] = adj_matrix[j][i] = True
+    
+    elif net_type == 'row':
+        # A-B-C-D-E
+        for i in range(num_agents - 1):
+            adj_matrix[i][i+1] = adj_matrix[i+1][i] = True
+            
+    elif net_type == 'star':
+        # Center is 0
+        for i in range(1, num_agents):
+            adj_matrix[0][i] = adj_matrix[i][0] = True
+            
+    elif net_type == 'circle':
+        # Ring
+        for i in range(num_agents - 1):
+            adj_matrix[i][i+1] = adj_matrix[i+1][i] = True
+        adj_matrix[0][num_agents-1] = adj_matrix[num_agents-1][0] = True
+
+# ********************************** 
+# Scenario Setup
+# ********************************** 
+def _create_agent_objects(agent_data: List[Dict], args, tasks: List[Task]) -> List[Agent]:
+    """
+    Instantiates Agent objects and injects the selected algorithm strategy.
+
+    This helper iterates through agent initialization data, assigns types (Medicine/Food)
+    based on index, creates the specified algorithm instance via the factory, and
+    binds the agent to the algorithm.
+
+    Args:
+        agent_data: A list of dictionaries containing initial positions for agents.
+        args: Parsed command-line arguments containing simulation parameters.
+        tasks: The global list of tasks (required for algorithm initialization).
+
+    Returns:
+        List[Agent]: A list of fully initialized Agent objects.
+    """
+    agents = []
+    cmap = plt.get_cmap('viridis')
+    num_agents = len(agent_data)
+
+    for i, info in enumerate(agent_data):
+        # Determine properties based on index (Medicine vs Food)
+        if i < num_agents / 2:
+            a_type = AGENT_TYPE_MEDICINE
+            speed = 30.0
+        else:
+            a_type = AGENT_TYPE_FOOD
+            speed = 50.0
+        
+        color = cmap(i / (num_agents - 1)) if num_agents > 1 else cmap(0.5)
+        pos = info['pos']
+
+        # Create Algorithm Strategy
+        algo = AlgorithmFactory.create(args.algorithm, i, args.max_tasks_per_agent, tasks)
+        
+        # Create Agent
+        new_agent = Agent(
+            id=i, agent_type=a_type, position=pos, speed=speed, 
+            color=color, algorithm=algo
+        )
+        
+        # Bind agent back to algorithm
+        algo.bind_agent(new_agent)
+        agents.append(new_agent)
+        
+    return agents
+
+def setup_scenario(args) -> Tuple[List[Task], List[Agent], Topology]:
+    """
+    Sets up the complete simulation scenario including tasks, agents, and topology.
+
+    This function handles two modes of initialization:
+    1. Random Generation: Creates tasks and agents with random positions if no load file is specified.
+    2. File Loading: Reconstructs the scenario from a saved configuration file.
+
+    It also handles the 'save' functionality if requested.
+
+    Args:
+        args: Parsed command-line arguments.
+
+    Returns:
+        Tuple[List[Task], List[Agent], Topology]: A tuple containing the lists of
+        created tasks and agents, and the initialized topology object.
+    """
+    tasks = []
+    agent_data_list = [] # Intermediate storage for agent positions
+
+    # --- Branch 1: Load from File ---
+    if args.load:
+        t_infos, a_infos = load_info_from_file(args.file)
+        
+        # 1. Reconstruct Tasks
+        for i, info in enumerate(t_infos):
+            t_type = TASK_TYPE_MEDICINE if i < len(t_infos) / 2 else TASK_TYPE_FOOD
+            tasks.append(Task(
+                id=i, task_type=t_type, position=info['pos'],
+                deadline=info['deadline'], exec_duration=info['duration']
+            ))
+        
+        # 2. Prepare Agent Data
+        agent_data_list = a_infos
+
+    # --- Branch 2: Generate Random ---
+    else:
+        # 1. Generate Tasks
+        for i in range(args.tasks):
+            t_type = TASK_TYPE_MEDICINE if i < args.tasks / 2 else TASK_TYPE_FOOD
+            tasks.append(Task(
+                id=i, task_type=t_type,
+                position=(random.uniform(0, FIELD_SIZE), random.uniform(0, FIELD_SIZE)),
+                deadline=random.uniform(0, 2000),
+                exec_duration=random.uniform(50, 100)
+            ))
+        
+        # 2. Generate Agent Positions
+        for i in range(args.agents):
+            pos = (random.uniform(0, FIELD_SIZE), random.uniform(0, FIELD_SIZE))
+            agent_data_list.append({'pos': pos})
+
+    # --- Common: Instantiate Agents & Algorithms ---
+    # Note: We need 'tasks' to exist before creating algorithms
+    agents = _create_agent_objects(agent_data_list, args, tasks)
+
+    # --- Save if requested (and not loading) ---
+    if args.save and not args.load:
+        filename = ensure_data_prefix(args.file)
+        save_info_to_file(tasks, agents, filename)
+
+    # --- Common: Finalize Setup ---
+    # 1. Setup Feasibility (Global Info)
+    feasibility = [[False] * len(tasks) for _ in range(len(agents))]
+    for i, agent in enumerate(agents):
+        for j, task in enumerate(tasks):
+            if agent.agent_type == task.task_type:
+                feasibility[i][j] = True
+    
+    for agent in agents:
+        agent.algorithm.finalize_setup(feasibility)
+
+    # 2. Topology
+    topology = Topology([a.id for a in agents])
+
+    if args.network != 'radius':
+        num = len(agents)
+        adj = [[False] * num for _ in range(num)]
+        setup_manual_network(adj, num, args.network)
+        topology.update_from_adjacency_matrix(adj)
+        print(f">>> Topology initialized as '{args.network}'")
+    else:
+        print(f">>> Topology will be calculated by Radius ({args.radius})")
+    
+    return tasks, agents, topology
+
+def parse_args():
+    """
+    Parses command-line arguments.
+
+    Defines and parses all available flags for simulation configuration, algorithm
+    selection, and input/output control.
+
+    Returns:
+        argparse.Namespace: An object containing the values of all command-line arguments.
+    """
+    parser = argparse.ArgumentParser(description="Unified MRTA Simulation Framework")
+    
+    # Algorithm Selection
+    parser.add_argument("--algo", dest="algorithm", type=str, default="v2", 
+                        choices=["original", "dynamic"], help="Algorithm strategy to use.")
+    
+    # Simulation Config
+    parser.add_argument("-a", "--agents", type=int, default=NUM_AGENTS, help="Number of agents")
+    parser.add_argument("-t", "--tasks", type=int, default=NUM_TASKS, help="Number of tasks")
+    parser.add_argument("-r", "--radius", type=float, default=RADIUS, help="Comm radius")
+    parser.add_argument("-m", "--max-tasks-per-agent", type=int, default=MAX_TASKS, help="Capacity constraint")
+    parser.add_argument("-i", "--max-iterations", type=int, default=MAX_ITER, help="Max iterations for static allocation")
+    parser.add_argument("--network", type=str, default='row', choices=['radius', 'row', 'star', 'circle', 'full'], help="Network topology type.")
+    
+    # IO & Control Flags
+    parser.add_argument("--save", action="store_true", help="Save scenario to file")
+    parser.add_argument("--load", action="store_true", help="Load scenario from file")
+    parser.add_argument("--file", type=str, default="scenario_info.txt", help="Filename for save/load")
+    parser.add_argument("--quiet", action="store_true", help="Run without visualization (Console only)")
+
+    return parser.parse_args()
+
+# ********************************** 
+# Main Entry
+# ********************************** 
+if __name__ == "__main__":
+    args = parse_args()
+    
+    # 1. Setup
+    tasks, agents, topology = setup_scenario(args)
+    is_fixed_topology = (args.network != 'radius')
+    env = Environment(
+        agents, 
+        tasks, 
+        topology, 
+        args.radius, 
+        fixed_topology=is_fixed_topology 
+    )
+
+    # 2. Select Generator Mode
+    if args.algorithm == "original":
+        print(">>> Mode: Static Allocation + Execution (Original PI)")
+
+        def chained_generator():
+            # Phase 1
+            yield from env.run_static_allocation(args.max_iterations)
+            # Phase 2
+            yield from env.run_static_execution(DT, MAX_TIME)
+        generator = chained_generator()
+        
+    else: # v1 or v2
+        print(f">>> Mode: Dynamic Simulation ({args.algorithm})")
+        generator = env.run_dynamic_simulation(DT, MAX_TIME)
+
+    # 3. Run
+    if args.quiet:
+        print("Running in quiet mode...")
+        for _ in generator: 
+            pass
+        print("Simulation finished.")
+    else:
+        # Pass environment to animator for access to static info if needed
+        animator = Animator(env, generator, args.radius)
+        animator.run()
+
+##### END FILE: ./main.py #####
+
+##### FILE: ./visualization/animator.py #####
+
+# --------------------------------------------------------
+# File: visualization/animator.py
+# Perform an animated demonstration of the simulation.
+# --------------------------------------------------------
+
+# The feature implementation is correct fine.
+
+import numpy as np
+import networkx as nx
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from matplotlib.patches import Circle
+from matplotlib.lines import Line2D
+
+class Animator:
+    """
+    Handles visualization for both static and dynamic multi-agent simulations.
+
+    This class is responsible for creating and managing the matplotlib animation
+    loop. It supports rendering tasks, agents, communication links (topology),
+    and agent paths for both static (two-phase) and dynamic (real-time) modes.
+
+    Attributes:
+        env: The simulation Environment object containing entity data.
+        generator (Generator): The simulation data generator yielding state snapshots.
+        comm_radius (float): The communication radius for visualizing coverage circles.
+        fig (plt.Figure): The matplotlib figure object.
+        ax (plt.Axes): The matplotlib axes object.
+        dynamic_artists (List[plt.Artist]): A list of artists (plot elements) drawn
+            in the current frame, used for efficient clearing/updating.
+        colors (Dict[str, str]): Mapping of task types to colors.
+        markers (Dict[str, str]): Mapping of agent types to plot markers.
+    """
+
+    def __init__(self, environment, generator, comm_radius):
+        """
+        Initializes the Animator with simulation context.
+
+        Args:
+            environment: The simulation Environment instance.
+            generator: A generator function yielding state dictionaries.
+            comm_radius: The visual radius for agent communication circles.
+        """
+        # Basic component
+        self.env = environment
+        self.generator = generator
+        self.comm_radius = comm_radius
+
+        # Setup figure
+        self.fig, self.ax = plt.subplots(figsize=(10, 10)) # Adjusted size
+        self.dynamic_artists = []
+        
+        # Visual fonfig
+        self.colors = {'medicine': 'red', 'food': 'green'}
+        self.markers = {'medicine': '^', 'food': 'P'}
+
+    def _init_plot(self):
+        """
+        Initializes the static background elements of the plot.
+
+        Sets up axis limits, titles, and static legends. This function is called
+        once at the start of the animation.
+
+        Returns:
+            List[plt.Artist]: An empty list as no dynamic artists are drawn initially.
+        """
+        self.ax.clear()
+        self.ax.set_xlim(0, 2000)
+        self.ax.set_ylim(0, 2000)
+        self.ax.set_title("Initializing...")
+        # Add legends
+        legend_elements = [
+            Line2D([0], [0], marker='^', color='w', markerfacecolor='gray', label='Agent (Medicine)', markersize=10),
+            Line2D([0], [0], marker='P', color='w', markerfacecolor='gray', label='Agent (Food)', markersize=10),
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='red', label='Task (Medicine)', markersize=8),
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='green', label='Task (Food)', markersize=8),
+        ]
+        self.ax.legend(handles=legend_elements, loc='best')
+        
+        return []
+
+    def _update(self, frame):
+        """
+        Updates the plot for a new animation frame.
+
+        Retrieves the next state from the simulation generator, clears old dynamic
+        elements, and redraws agents, tasks, topology, and paths.
+
+        Args:
+            frame: The current frame index (automatically passed by FuncAnimation).
+
+        Returns:
+            List[plt.Artist]: A list of all dynamic artists drawn in this frame.
+        """
+        try:
+            # Retrieve the physical state of each frame in the simulation
+            state = next(self.generator)
+        except StopIteration:
+            # Stop animation if generator is exhausted
+            return []
+
+        # Clear previous dynamic elements (but keep static background)
+        for artist in self.dynamic_artists:
+            artist.remove()
+        self.dynamic_artists = []
+
+        # --- 1. Draw Tasks ---
+        # Only draw uncompleted tasks to visualize progress
+        for task in state['tasks']:
+            if not task.completed:
+                # Draw Task point
+                sc = self.ax.scatter(task.position[0], task.position[1], 
+                                     c=self.colors[task.task_type], s=100, zorder=3)
+                # Draw Task ID label
+                tx = self.ax.text(task.position[0], task.position[1]-40, f"T{task.id}", ha='center')
+                self.dynamic_artists.extend([sc, tx])
+
+        # --- 2. Draw topology ---
+        # Draw edges between agents if they are connected in the graph
+        pos = {a.id: a.position for a in state['agents']}
+        edges = nx.draw_networkx_edges(state['topology'].graph, pos=pos, ax=self.ax, 
+                                       edge_color='gray', style='--', alpha=0.5)
+        if edges:
+            self.dynamic_artists.append(edges)
+
+        # --- 3. Draw Agents & paths ---
+        for agent in state['agents']:
+            # Draw communication range (circle)
+            c = Circle(agent.position, self.comm_radius, color='gray', alpha=0.1)
+            self.ax.add_patch(c)
+            self.dynamic_artists.append(c)
+            
+            # Draw agent body
+            sc = self.ax.scatter(agent.position[0], agent.position[1], 
+                                 color=agent.color, marker=self.markers[agent.agent_type], s=150, zorder=5, edgecolors='black')
+            # Draw Agent ID label
+            tx = self.ax.text(agent.position[0], agent.position[1]+40, f"A{agent.id}", ha='center')
+            self.dynamic_artists.extend([sc, tx])
+
+            # Draw planned path
+            # Fetches the current intended path directly from the algorithm interface
+            plan = agent.algorithm.get_plan()
+            if plan:
+                # Construct path points: [Current Pos] -> [Task 1] -> [Task 2] ...
+                pts = [agent.position] + [self.env.tasks[tid].position for tid in plan]
+                pts = np.array(pts)
+                ln, = self.ax.plot(pts[:,0], pts[:,1], c=agent.color, ls='-', lw=1, alpha=0.6)
+                self.dynamic_artists.append(ln)
+
+        # --- 4. Update title ---
+        t_str = f"Time: {state['time']:.1f}s"
+        if 'iteration' in state and state['iteration'] > 0:
+            # For static allocation phase, show iteration count
+            t_str = f"Allocation Iter: {state['iteration']}"
+        
+        self.ax.set_title(f"MRTA Simulation | {t_str}")
+
+        return self.dynamic_artists
+
+    def run(self):
+        """
+        Starts the matplotlib animation loop.
+
+        Configures and runs `FuncAnimation`. The plot window will block execution
+        until closed.
+        """
+        _ = animation.FuncAnimation(
+            self.fig, 
+            self._update, 
+            init_func=self._init_plot, 
+            interval=50,       # Update every 50ms
+            blit=False,        # Turn off blitting for compatibility with dynamic artists
+            save_count=500     # Max frames to cache if saving
+        )
+        plt.show()
+
+##### END FILE: ./visualization/animator.py #####
+

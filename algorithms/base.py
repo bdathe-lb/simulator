@@ -40,6 +40,7 @@ class BaseAlgorithm(ABC):
         # Derived classed should Initialize their specific data structures here
         # e.g., `significance_list`, `timestamp_list`, etc.
 
+
     @abstractmethod
     def bind_agent(self, agent: Any) -> None:
         """
