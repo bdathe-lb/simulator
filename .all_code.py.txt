@@ -1,6 +1,6 @@
 # Combined Python source files
 # Root: .
-# Generated: 2026-01-15T13:53:16+08:00
+# Generated: 2026-01-20T13:19:29+08:00
 
 ##### FILE: ./algorithms/base.py #####
 
@@ -45,6 +45,7 @@ class BaseAlgorithm(ABC):
 
         # Derived classed should Initialize their specific data structures here
         # e.g., `significance_list`, `timestamp_list`, etc.
+
 
     @abstractmethod
     def bind_agent(self, agent: Any) -> None:
@@ -120,6 +121,18 @@ class BaseAlgorithm(ABC):
 
 # --------------------------------------------------------
 # File: algorithms/dynamic_pi.py
+#
+# "Robust Dynamic PI for Communication-Constrained Environments"
+#
+# Key Academic Mechanisms:
+#   1. Cyber-Physical Binding (Execution Locking): 
+#      Resolves assignment-execution conflicts by prioritizing physical states.
+#   2. Scalar Task Consensus (Lightweight Consistency): 
+#      Replaces vector clocks with task-based scalar timestamps for robustness.
+#   3. Inertia-Based Stability Control: 
+#      Prevents "ping-pong" effects in dynamic topologies.
+#   4. Tiered Spatio-Temporal Inclusion: 
+#      Heuristically prioritizes tasks by urgency (deadline) then proximity.
 # --------------------------------------------------------
 
 import math
@@ -128,567 +141,560 @@ from typing import List, Dict, Any, Tuple
 from algorithms.base import BaseAlgorithm
 from core.task import Task
 
-# Constants
-INFINITY = float('inf')
+# --- Constants Definitions ---
+# Represents a task that is unassigned or has infinite cost
+SIG_INFINITY = float('inf')   
+# Represents a task that is physically being executed and cannot be preempted
+SIG_HARD_LOCK = -1.0          
 
 class DynamicPI(BaseAlgorithm):
     """
-    Implements the V3 Optimized Dynamic Algorithm (Standalone).
+    Implements the Robust Dynamic PI Algorithm.
 
-    This class consolidates logic from Original PI, V1, and V2 into a single
-    optimized implementation. It features tiered task inclusion, pinned 2-opt
-    path optimization, and robust handling for dynamic environments (congestion
-    awareness, blacklisting, and execution locking).
+    This algorithm extends the Performance Impact (PI) method to handle 
+    dynamic environments with restricted communication. It introduces a 
+    Cyber-Physical state machine to handle execution conflicts and uses 
+    scalar consensus for robust consistency.
     """
 
     def __init__(self, agent_id: int, max_tasks: int, all_tasks: List[Task]) -> None:
         """
-        Initializes the V3 algorithm with all necessary state variables.
+        Initializes the Dynamic PI algorithm state.
+
+        Args:
+            agent_id: The unique ID of the agent.
+            max_tasks: The maximum number of tasks this agent can carry.
+            all_tasks: Reference list of all available tasks.
         """
         super().__init__(agent_id, max_tasks, all_tasks)
-        
         num_tasks = len(all_tasks)
-
-        # --- Basic PI State (Originally from OriginalPI) ---
+        
+        # =========================================================
+        # 1. Core Algorithm State
+        # =========================================================
+        # The planned execution sequence of task IDs
         self.tasks_sequence_list: List[int] = []
-        self.significance_list: List[float] = [INFINITY] * num_tasks
-        # Note: assigned_agent_list tracks who we think owns the task
+        # The significance list (Gamma).
+        # Values can be:
+        #   - SIG_HARD_LOCK: Physically locked by an agent
+        #   - SIG_INFINITY: Unassigned
+        #   - Float value: The estimated removal cost
+        self.significance_list: List[float] = [SIG_INFINITY] * num_tasks
+        # The assigned agent list
         self.assigned_agent_list: List[int] = [-1] * num_tasks 
-        self.marginal_significance_list: List[float] = [0.0] * num_tasks
         
-        # --- Robust State (Originally from RobustDynamicPI) ---
-        # Timestamps for Scalar Clock Consensus
+        # =========================================================
+        # 2. Consensus State
+        # =========================================================
+        # Scalar Timestamp List
+        # Records the last update time for each task to resolve conflicts
         self.task_timestamps: List[float] = [0.0] * num_tasks
-        # Blacklist: {task_id -> expiration_time}
-        self.blacklist: Dict[int, float] = {}
-        # Execution Locks: {task_id -> agent_id} (Who is physically executing what)
-        self.known_execution_locks: Dict[int, int] = {}
         
-        # Internal State
+        # =========================================================
+        # 3. Stability Control State
+        # =========================================================
+        # Cooling Blacklist: {task_id: expiration_time}
+        # Prevents the agent from immediately re-bidding on a lost task
+        self.blacklist: Dict[int, float] = {}
+        
+        # =========================================================
+        # 4. Context Awareness & Binding
+        # =========================================================
         self.current_time = 0.0
         self._is_currently_congested = False
-        self.agent = None
-        self.feasibility_matrix = []
 
-        # --- Configuration Parameters ---
-        self.BLACKLIST_DURATION = 10.0
-        self.PASSIVE_COOLING_DURATION = 3.0
-        self.STALE_TIMEOUT = 30.0 
-        self.INERTIA_THRESHOLD = 15.0 
-        self.HARD_LOCK_SIG = -1.0
-        self.CONGESTION_RADIUS = 20.0 
-        self.CONGESTION_PENALTY = 2000.0 
+        self.agent = None            # Bound in bind_agent()
+        self.feasibility_matrix = [] # Bound in finalize_setup()
+
+        # =========================================================
+        # 5. Hyperparameters
+        # =========================================================
+        self.BLACKLIST_DURATION = 10.0      # Duration to ignore a lost task
+        self.INERTIA_THRESHOLD = 15.0       # Min improvement needed to switch owners
+        self.STALE_TIMEOUT = 30.0           # Time before resetting stale info
+        self.CONGESTION_PENALTY = 2000.0    # Significance penalty during congestion
+        self.CONGESTION_RADIUS = 20.0       # Radius to detect neighbor congestion
 
     # *******************************************************
-    # Interface Implementation (From BaseAlgorithm)
+    # Interface Implementation & State Mapping
     # *******************************************************
-
+    
     def bind_agent(self, agent: Any) -> None:
+        """Binds the physical agent instance to the algorithm."""
         self.agent = agent
 
     def finalize_setup(self, feasibility_matrix: List[List[bool]]) -> None:
+        """Sets up the global feasibility matrix."""
         self.feasibility_matrix = feasibility_matrix
-
+        
     def get_plan(self) -> List[int]:
+        """Returns the current planned task sequence."""
         return self.tasks_sequence_list
 
     def pack_message(self) -> Dict[str, Any]:
         """
-        Packs state for broadcast. Includes Hard Lock logic from V2.
+        Packs the internal state into a message for broadcasting.
+
+        [Mechanism: Cyber-Physical Binding]
+        If the agent is physically executing a task, it overrides the broadcast 
+        significance to SIG_HARD_LOCK, regardless of internal calculations.
+
+        Returns:
+            A dictionary containing the agent's state, bids, and timestamps.
         """
-        # [Fix] Ensure agent is bound before accessing attributes
-        assert self.agent is not None, "Agent must be bound before packing messages"
+        assert self.agent is not None, "Agent must be bound" 
+       
 
-        broadcast_sig = list(self.significance_list)
+        # 1. Copy the current Significance list
+        broadcast_significance = list(self.significance_list)
         
-        # Override bid with HARD_LOCK if physically executing
+        # 2. Enforce Hard Lock for physical consistency
+        # If I am physically executing a task, I must broadcast a Hard Lock.
         if self.agent.status == 'EXECUTING' and self.agent.current_target_task_id is not None:
-            tid = self.agent.current_target_task_id
-            broadcast_sig[tid] = self.HARD_LOCK_SIG
-
+            target_task_id = self.agent.current_target_task_id
+            broadcast_significance[target_task_id] = SIG_HARD_LOCK
+            
+            # Update timestamp to current time to ensure neighbors accept this lock
+            self.task_timestamps[target_task_id] = self.current_time
+        
+        # 3. Construct message packet
         return {
             "sender_id": self.agent_id,
-            "significance_list": broadcast_sig,
+            "significance_list": broadcast_significance,
             "assigned_agent_list": self.assigned_agent_list,
-            "sender_target_id": self.agent.current_target_task_id,
             "task_timestamps": self.task_timestamps,
-            "sender_status": self.agent.status,
             "sender_position": self.agent.position
         }
 
     # *******************************************************
-    # Dynamic Event Hooks
+    # Cyber-Physical Event Hooks
     # *******************************************************
-
-    def on_task_completed(self, task_id: int) -> None:
-        if task_id in self.tasks_sequence_list:
-            self.tasks_sequence_list.remove(task_id)
-        if task_id in self.known_execution_locks:
-            del self.known_execution_locks[task_id]
 
     def on_task_locked(self, task_id: int) -> None:
+        """
+        Triggered when the physical agent starts executing a task.
+        
+        [Mechanism: Execution Locking]
+        Transitions the task state from 'Soft Assignment' (significance-based) to 
+        'Hard Lock' (physical authority), preventing preemption.
+
+        Args:
+            task_id: The ID of the task being locked.
+        """
+        # 1. Force-set Hard Lock signal
+        self.significance_list[task_id] = SIG_HARD_LOCK
+        
+        # 2. Confirm ownership locally
+        self.assigned_agent_list[task_id] = self.agent_id
+        
+        # 3. Update timestamp to prioritize this state
         self.task_timestamps[task_id] = self.current_time
-        self.known_execution_locks[task_id] = self.agent_id
-        self.significance_list[task_id] = self.HARD_LOCK_SIG
+
+    def on_task_completed(self, task_id: int) -> None:
+        """
+        Triggered when the task is physically completed.
+        
+        Cleans up the internal state to prevent the algorithm from 
+        re-assigning the completed task.
+
+        Args:
+            task_id: The ID of the completed task.
+        """
+        # 1. Remove from the execution queue
+        if task_id in self.tasks_sequence_list:
+            self.tasks_sequence_list.remove(task_id)
+            
+        # 2. Reset algorithm state for this task
+        self.significance_list[task_id] = SIG_INFINITY
+        self.assigned_agent_list[task_id] = -1
 
     # *******************************************************
-    # Main Loop
+    # Main Control Loop
     # *******************************************************
 
     def run_iteration(self, messages: List[Dict[str, Any]]) -> None:
-        # [Fix] Ensure agent is bound for the iteration
-        assert self.agent is not None, "Agent must be bound to run iteration"
+        """
+        Executes one iteration of the dynamic control loop.
 
+        This follows a structured cycle: 
+        Sense (Context) -> Maintain -> Perceive (Consensus) -> Plan (Removal/Inclusion).
+
+        Args:
+            messages: List of messages received from neighbors.
+        """
+        assert self.agent is not None, "Agent must be bound to run iteration" 
         self.current_time += 1.0
 
-        # 1. Update Congestion Status
+        # 1. Context Awareness: Check for local congestion
         self._is_currently_congested = self._calculate_congestion_status(messages)
-
-        # 2. Maintenance
+        
+        # 2. Maintenance: Clear stale information
         self._check_stale_information()
         
-        # 3. Phases
-        self._task_inclusion_phase() # V3 Tiered Logic
-        self._consensus_phase(messages) # V2 Robust Logic
-        self._task_removal_phase()   # V3 Optimized Removal
+        # 3. Consensus Phase: Resolve conflicts using Scalar Consensus
+        self._consensus_phase(messages)
         
-        # 4. Cleanup
+        # 4. Planning Phase A: Task Removal
+        self._task_removal_phase()
+        
+        # 5. Planning Phase B: Task Inclusion
+        self._task_inclusion_phase()
+        
+        # 6. Cleanup: Manage cooling timers
         self._cleanup_blacklist()
 
     # *******************************************************
-    # Phase 1: Inclusion (V3 Tiered Strategy)
+    # Phase 1: Consensus
     # *******************************************************
 
-    def _task_inclusion_phase(self) -> None:
+    def _consensus_phase(self, messages: List[Dict[str, Any]]) -> None:
         """
-        V3 Strategy: Tiered Sorting + Greedy Insertion.
+        Phase 1: Scalar Task Consensus.
+
+        [Mechanism: Scalar Consensus with Inertia & Hard Locks]
+        Resolves conflicts using task-based scalar timestamps instead of vector clocks.
+        It prioritizes physical execution states (Hard Locks) and uses an inertia 
+        threshold to prevent system oscillation ("ping-pong" effect).
+
+        Args:
+            messages: List of messages received from neighbors.
         """
-        # [Fix] Ensure agent exists
         assert self.agent is not None
 
-        # Early exit if full and busy
-        if self.agent.status == 'EXECUTING' and len(self.tasks_sequence_list) >= self.max_tasks:
-            return
-        
-        is_desperate = (len(self.tasks_sequence_list) == 0)
-        penalty = self.CONGESTION_PENALTY if (self._is_currently_congested and not is_desperate) else 0.0
-
-        # 1. Filter Candidates
-        candidate_tasks = [
-            t for t in self.all_tasks 
-            if not t.completed and 
-            t.id not in self.blacklist and 
-            t.id not in self.tasks_sequence_list and 
-            self.feasibility_matrix[self.agent_id][t.id]
-        ]
-        
-        # 2. Tiered Sorting Strategy
-        URGENCY_THRESHOLD = 150.0 
-        current_t = self.current_time
-        
-        def tiered_sort_key(task):
-            # [Fix] self.agent is already asserted not None above
-            time_left = task.deadline - current_t
-            if time_left < URGENCY_THRESHOLD:
-                # Tier 1: Critical (Sort by Deadline)
-                return (0, task.deadline)
-            else:
-                # Tier 2: Safe (Sort by Distance)
-                dist = np.linalg.norm(task.position - self.agent.position) # type: ignore
-                return (1, dist)
-
-        candidate_tasks.sort(key=tiered_sort_key)
-
-        # 3. Greedy Insertion
-        while len(self.tasks_sequence_list) < self.max_tasks:
-            max_diff = -INFINITY
-            best_task = -1
-            best_pos = -1
-
-            for task in candidate_tasks:
-                # Skip locked tasks
-                if self.significance_list[task.id] == self.HARD_LOCK_SIG: 
-                    continue
-                if task.id in self.known_execution_locks:
-                    if self.known_execution_locks[task.id] != self.agent_id: 
-                        continue
-
-                # Calculate Marginal
-                marginal, pos = self._calculate_marginal_significance(task)
-                marginal += penalty
-
-                # Strict Deadline Check
-                if math.isinf(marginal): 
-                    continue
-                arrival_time = self.current_time + self._calculate_reach_time(task.id, pos)
-                if arrival_time > task.deadline: 
-                    continue
-
-                # Calculate Gain
-                diff = self.significance_list[task.id] - marginal
-
-                if diff > 1e-4 and diff > max_diff:
-                    max_diff = diff
-                    best_task = task.id
-                    best_pos = pos
-            
-            if max_diff > 0:
-                self.tasks_sequence_list.insert(best_pos, best_task)
-                self.significance_list[best_task] = max_diff # Store gain as significance
-                self.assigned_agent_list[best_task] = self.agent_id
-                self.task_timestamps[best_task] = self.current_time
-                # Remove from candidates
-                candidate_tasks = [t for t in candidate_tasks if t.id != best_task]
-            else:
-                break
-        
-        # 4. Post-Inclusion Optimization
-        self._optimize_path_with_pinned_2opt()
-
-        # 5. Cascade Update
-        self._update_internal_significance(penalty)
-
-    # *******************************************************
-    # Phase 2: Consensus (V2 Robust Logic)
-    # *******************************************************
-
-    def _consensus_phase(self, messages: List[Dict]) -> None:
-        """
-        Resolves conflicts using Scalar Timestamps, Inertia, and Hard Locks.
-        """
-        # [Fix] Ensure agent is bound
-        assert self.agent is not None
-
-        # Part A: Update Execution Locks Cache
         for msg in messages:
-            n_id = msg['sender_id']
-            n_status = msg.get('sender_status', 'IDLE')
-            n_target = msg.get('sender_target_id', None)
+            neighbor_significance = msg['significance_list']
+            neighbor_assigned = msg['assigned_agent_list']
+            neighbor_timestamps = msg['task_timestamps']
 
-            if n_status == 'EXECUTING' and n_target is not None:
-                self.known_execution_locks[n_target] = n_id
-            
-            # Remove stale locks
-            keys_to_delete = [tid for tid, owner in self.known_execution_locks.items() 
-                              if owner == n_id and (n_status != 'EXECUTING' or n_target != tid)]
-            for k in keys_to_delete:
-                del self.known_execution_locks[k]
-
-        # Part B: Bidding & Consensus
-        for msg in messages:
-            n_id = msg['sender_id']
-            n_sig = msg['significance_list']
-            n_assign = msg['assigned_agent_list']
-            n_ts = msg['task_timestamps']
-
-            num_tasks = len(self.all_tasks)
-            for tid in range(num_tasks):
-                # Rule 1: Self Executing -> I win
-                am_executing = (self.agent.status == 'EXECUTING' and 
-                                self.agent.current_target_task_id == tid)
-                if am_executing:
-                    self.task_timestamps[tid] = self.current_time
+            for task_id in range(len(self.all_tasks)):
+                # --- Rule 1: Self-Execution Authority ---
+                # If I am physically executing the task, I am the ultimate authority.
+                # I ignore neighbor info and refresh my timestamp.
+                if self.agent.status == 'EXECUTING' and self.agent.current_target_task_id == task_id:
+                    self.task_timestamps[task_id] = self.current_time
+                    self.significance_list[task_id] = SIG_HARD_LOCK
+                    self.assigned_agent_list[task_id] = self.agent_id
                     continue
 
-                # Rule 2: Neighbor Hard Lock -> They win
-                if n_sig[tid] == self.HARD_LOCK_SIG:
-                     if tid in self.tasks_sequence_list or self.assigned_agent_list[tid] == self.agent_id:
-                          self.blacklist[tid] = self.current_time + self.BLACKLIST_DURATION
-                     
-                     self.significance_list[tid] = self.HARD_LOCK_SIG
-                     self.assigned_agent_list[tid] = n_id
-                     self.task_timestamps[tid] = max(self.task_timestamps[tid], n_ts[tid], self.current_time)
-                     continue
+                # --- Rule 2: Neighbor Hard Lock Authority ---
+                # If neighbor signals a Hard Lock, they win immediately.
+                if neighbor_significance[task_id] == SIG_HARD_LOCK:
+                    self._accept_neighbor_info(task_id, neighbor_significance, neighbor_assigned, neighbor_timestamps)
+                    
+                    # If I thought I owned it, I lost it. Enter cooling period.
+                    if self.assigned_agent_list[task_id] == self.agent_id:
+                         self.blacklist[task_id] = self.current_time + self.BLACKLIST_DURATION
+                    continue
                 
-                # Rule 3: Standard Consensus (Scalar Timestamp + Inertia)
-                ts_local = self.task_timestamps[tid]
-                ts_neighbor = n_ts[tid]
-                i_am_owner = (self.assigned_agent_list[tid] == self.agent_id)
+                # --- Rule 3: Scalar Freshness & Inertia ---
+                my_ts = self.task_timestamps[task_id]
+                neighbor_ts = neighbor_timestamps[task_id]
                 
-                # Case A: Neighbor is strictly newer
-                if ts_neighbor > ts_local:
-                    if i_am_owner:
-                        # Inertia Check
-                        if n_sig[tid] < self.significance_list[tid] - self.INERTIA_THRESHOLD:
-                            self._accept_neighbor_info(tid, n_sig, n_assign, ts_neighbor)
+                # Case A: Neighbor has strictly newer information
+                if neighbor_ts > my_ts:
+                    if self.assigned_agent_list[task_id] == self.agent_id:
+                        # [Mechanism: Inertia]
+                        # If I own the task, only switch if neighbor's significance (cost) 
+                        # is significantly lower than mine (by INERTIA_THRESHOLD).
+                        improvement = self.significance_list[task_id] - neighbor_significance[task_id]
+                        if improvement > self.INERTIA_THRESHOLD:
+                            self._accept_neighbor_info(task_id, neighbor_significance, neighbor_assigned, neighbor_timestamps)
                         else:
-                            self.task_timestamps[tid] = max(ts_local, ts_neighbor)
+                            # Reject the switch, but update timestamp to acknowledge I saw the bid.
+                            # This prevents the neighbor from repeatedly sending the same "new" info.
+                            self.task_timestamps[task_id] = self.current_time
                     else:
-                         self._accept_neighbor_info(tid, n_sig, n_assign, ts_neighbor)
+                        # I am not the owner, simply accept the newer information.
+                        self._accept_neighbor_info(task_id, neighbor_significance, neighbor_assigned, neighbor_timestamps)
 
-                # Case B: Concurrent (Approx Equal)
-                elif math.isclose(ts_neighbor, ts_local):
-                    threshold = self.INERTIA_THRESHOLD if i_am_owner else 0.0
-                    if n_sig[tid] < self.significance_list[tid] - threshold:
-                         self._accept_neighbor_info(tid, n_sig, n_assign, ts_neighbor)
-                
-                # Consistency Check
-                if n_id == self.assigned_agent_list[tid] and self.significance_list[tid] != self.HARD_LOCK_SIG:
-                     if abs(n_sig[tid] - self.significance_list[tid]) > 1e-6:
-                         self.significance_list[tid] = n_sig[tid]
+                # Case B: Concurrent information (Approximate Equal timestamps)
+                elif math.isclose(neighbor_ts, my_ts):
+                    # Tie-Breaker: Lower Significance wins
+                    if neighbor_significance[task_id] < self.significance_list[task_id]:
+                         self._accept_neighbor_info(task_id, neighbor_significance, neighbor_assigned, neighbor_timestamps)
+                    # Tie-Breaker: If Significance equal, Lower Agent ID wins
+                    elif math.isclose(neighbor_significance[task_id], self.significance_list[task_id]):
+                        if neighbor_assigned[task_id] != -1 and neighbor_assigned[task_id] < self.assigned_agent_list[task_id]:
+                             self._accept_neighbor_info(task_id, neighbor_significance, neighbor_assigned, neighbor_timestamps)
 
-    def _accept_neighbor_info(self, tid, n_sig, n_assign, ts):
-        self.significance_list[tid] = n_sig[tid]
-        self.assigned_agent_list[tid] = n_assign[tid]
-        self.task_timestamps[tid] = ts
+    def _accept_neighbor_info(self, task_id, n_sigs, n_owners, n_timestamps):
+        """Helper to atomically update local state with neighbor's info."""
+        self.significance_list[task_id] = n_sigs[task_id]
+        self.assigned_agent_list[task_id] = n_owners[task_id]
+        self.task_timestamps[task_id] = n_timestamps[task_id]
 
     # *******************************************************
-    # Phase 3: Removal (V3 Optimization + V2 Logic)
+    # Phase 2: Removal 
     # *******************************************************
 
     def _task_removal_phase(self) -> None:
         """
-        Combines V3's Pre-Removal Optimization with V2's Removal Logic.
+        Phase 2: Task Removal.
+
+        Removes tasks that were lost during consensus or have become 
+        inefficient due to congestion or constraint violations.
         """
-        # [Fix] Ensure agent is bound
         assert self.agent is not None
-
-        # 1. Optimization Attempt
-        self._optimize_path_with_pinned_2opt()
         
-        # 2. Update Significance before checking removal conditions
-        penalty = self.CONGESTION_PENALTY if self._is_currently_congested else 0.0
-        self._update_internal_significance(penalty)
-
-        # 3. Standard Removal Logic (Copied from V2)
-        am_executing = (self.agent.status == 'EXECUTING' and self.agent.current_target_task_id is not None)
-        executing_tid = self.agent.current_target_task_id if am_executing else -1
-        
-        to_remove = []
-        temp_sequence = self.tasks_sequence_list.copy()
-
-        for tid in temp_sequence:
-            if tid == executing_tid: 
-                continue
-
-            # Reason 1: Lost Ownership
-            if self.assigned_agent_list[tid] != self.agent_id:
-                to_remove.append((tid, "PASSIVE_LOST_OWNERSHIP"))
-                continue
+        # 1. Remove tasks lost during Consensus (Ownership mismatch)
+        lost_tasks = [
+            task_id for task_id in self.tasks_sequence_list
+            if self.assigned_agent_list[task_id] != self.agent_id
+        ]
+        for task_id in lost_tasks:
+            self.tasks_sequence_list.remove(task_id)
+            self.blacklist[task_id] = self.current_time + self.BLACKLIST_DURATION
             
-            # Reason 2: Constraint Violation (Deadline)
-            # Note: _calculate_significance uses _calculate_total_path_cost which returns INF on violation
-            real_sig = self._calculate_significance(self.all_tasks[tid])
-            if math.isinf(real_sig):
-                to_remove.append((tid, "ACTIVE_CONSTRAINT_VIOLATION"))
-                continue
-
-            # Reason 3: Congestion Pruning
-            if self._is_currently_congested:
-                to_remove.append((tid, "CONGESTION_AVOIDANCE"))
-
-        # Execute Removal
-        for tid, reason in to_remove:
-            if tid in self.tasks_sequence_list:
-                self.tasks_sequence_list.remove(tid)
+        # 2. Iterative Greedy Removal (Synergy & Efficiency Check)
+        while True:
+            max_reduction = -SIG_INFINITY
+            task_to_remove = -1
+            
+            # [Mechanism: Congestion Avoidance]
+            # Reduce willingness to keep tasks if in a congested area.
+            penalty = self.CONGESTION_PENALTY if self._is_currently_congested else 0.0
+            
+            for task_id in self.tasks_sequence_list:
+                # Never remove the task currently being executed (Physical Hard Lock)
+                if task_id == self.agent.current_target_task_id and self.agent.status == 'EXECUTING':
+                    continue
                 
-                if reason == "PASSIVE_LOST_OWNERSHIP":
-                     self.blacklist[tid] = self.current_time + self.PASSIVE_COOLING_DURATION
-                elif reason == "CONGESTION_AVOIDANCE":
-                     self.blacklist[tid] = self.current_time + 5.0
+                local_significance = self._calculate_significance(task_id)
+                
+                # Adjust local value with penalty
+                adjusted_local_sig = local_significance + penalty 
+                global_sig = self.significance_list[task_id]
+                
+                # Check 1: Constraint Violation (Deadline missed -> Infinite Cost)
+                # This task will cause a timeout and needs to be removed
+                if math.isinf(local_significance):
+                    diff = SIG_INFINITY
+                # Check 2: Efficiency (Am I still the best agent for this task?)
+                # If (My Adjusted Cost) > (Market Cost), I am inefficient.
+                else:
+                    diff = adjusted_local_sig - global_sig
 
-            # Reset internal state
-            if not self.all_tasks[tid].completed and self.assigned_agent_list[tid] == self.agent_id:
-                self.assigned_agent_list[tid] = -1
-                self.significance_list[tid] = INFINITY
-                self.task_timestamps[tid] = self.current_time
-                self.blacklist[tid] = self.current_time + self.BLACKLIST_DURATION
+                if diff > max_reduction:
+                    max_reduction = diff
+                    task_to_remove = task_id
+            
+            # Execute removal if it improves the objective (reduces cost discrepancy)
+            if max_reduction > 1e-6:
+                self.tasks_sequence_list.remove(task_to_remove)
+                # Note: No re-optimization call here as requested
+            else:
+                break
 
     # *******************************************************
-    # Optimization Logic (V3 Specific)
+    # Phase 3: Inclusion 
     # *******************************************************
 
-    def _optimize_path_with_pinned_2opt(self) -> None:
+    def _task_inclusion_phase(self) -> None:
         """
-        Applies 2-Opt Local Search while pinning the active target.
+        Phase 3: Tiered Spatio-Temporal Inclusion.
+
+        [Mechanism: Tiered Spatio-Temporal Inclusion]
+        Heuristically selects tasks to add. It departs from pure greedy selection 
+        by prioritizing tasks based on 'Urgency' (Deadline) first, and then 
+        'Proximity' (Distance).
         """
-        # [Fix] Ensure agent is bound
         assert self.agent is not None
-
-        path = self.tasks_sequence_list
-        n = len(path)
-        if n < 3: 
-            return
-
-        # Pinning Logic
-        start_index = 0
-        if self.agent.status != 'IDLE' and self.agent.current_target_task_id is not None:
-            if path and path[0] == self.agent.current_target_task_id:
-                start_index = 1
         
-        if n - start_index < 2: 
+        # Capacity check
+        if len(self.tasks_sequence_list) >= self.max_tasks:
             return
 
-        improved = True
-        while improved:
-            improved = False
-            for i in range(start_index, n - 1):
-                for j in range(i + 1, n):
-                    new_path = path[:i] + path[i:j+1][::-1] + path[j+1:]
-                    
-                    current_cost = self._calculate_total_path_cost(path)
-                    new_cost = self._calculate_total_path_cost(new_path)
+        # 1. Filter Candidates
+        candidates = [
+            task for task in self.all_tasks 
+            if not task.completed 
+            and task.id not in self.blacklist 
+            and task.id not in self.tasks_sequence_list 
+            and self.feasibility_matrix[self.agent_id][task.id]
+        ]
+        
+        # 2. Tiered Sorting Strategy
+        URGENCY_THRESHOLD = 150.0 
+        
+        def tiered_key(task):
+            """
+            Sorts tasks into two tiers:
+            Tier 1 (Critical): Deadline is approaching. Sort by time remaining.
+            Tier 2 (Normal): Deadline is far. Sort by distance (Spatial).
+            """
+            assert self.agent is not None
+            time_left = task.deadline - self.current_time
+            
+            if time_left < URGENCY_THRESHOLD:
+                return (0, time_left) 
+            else:
+                dist = np.linalg.norm(task.position - self.agent.position)
+                return (1, dist)
+        
+        candidates.sort(key=tiered_key)
+        
+        # 3. Greedy Insertion
+        for task in candidates:
+            # Re-check capacity
+            if len(self.tasks_sequence_list) >= self.max_tasks:
+                break
+                
+            marginal_significance, pos = self._calculate_marginal_significance(task)
+            
+            # If infeasible (deadline violation), skip
+            if math.isinf(marginal_significance):
+                continue
+                
+            global_significance = self.significance_list[task.id]
+            significance_gain = global_significance - marginal_significance
+            
+            # If positive gain, acquire the task
+            if significance_gain > 0:
+                self.tasks_sequence_list.insert(pos, task.id)
+                self.assigned_agent_list[task.id] = self.agent_id
+                self.significance_list[task.id] = marginal_significance
+                
+                # Claim ownership by updating timestamp to now
+                self.task_timestamps[task.id] = self.current_time 
+                
+        # Update significance for all tasks after modifications
+        self._update_internal_significance()
 
-                    if new_cost < current_cost and not math.isinf(new_cost):
-                        # Safety check for feasibility
-                        if self._is_path_feasible(new_path):
-                            path = new_path
-                            self.tasks_sequence_list = new_path
-                            improved = True
-                            break 
-                if improved: 
-                    break
-
-    def _is_path_feasible(self, path: List[int]) -> bool:
-        # [Fix] Ensure agent is bound
-        assert self.agent is not None
-
-        curr_pos = self.agent.position
-        curr_time = self.current_time
-        for tid in path:
-            task = self.all_tasks[tid]
-            dist = np.linalg.norm(task.position - curr_pos)
-            arrival = curr_time + (dist / self.agent.speed)
-            if arrival > task.deadline: 
-                return False
-            curr_time = arrival + task.exec_duration
-            curr_pos = task.position
-        return True
+    def _update_internal_significance(self) -> None:
+        """Batch updates significance for all tasks in the local sequence."""
+        for task_id in self.tasks_sequence_list:
+            self.significance_list[task_id] = self._calculate_significance(task_id)
 
     # *******************************************************
-    # Helpers (Maintenance & Congestion)
+    # Helpers & Math
     # *******************************************************
 
     def _calculate_congestion_status(self, messages: List[Dict]) -> bool:
-        # [Fix] Ensure agent is bound
+        """
+        Detects local congestion based on neighbor proximity.
+        
+        Returns:
+            True if a higher-priority agent (lower ID) is within 
+            CONGESTION_RADIUS, prompting a yield behavior.
+        """
         assert self.agent is not None
-
         my_pos = self.agent.position
+        
         for msg in messages:
-            n_id = msg['sender_id']
-            n_pos = msg.get('sender_position')
-            if n_pos is not None:
-                dist = np.linalg.norm(my_pos - n_pos)
-                # Congested if close to a higher priority (lower ID) agent
-                if dist < self.CONGESTION_RADIUS and n_id < self.agent_id:
+            neighbor_pos = msg.get('sender_position')
+            sender_id = msg['sender_id']
+            if neighbor_pos is not None:
+                dist = np.linalg.norm(my_pos - neighbor_pos)
+                if dist < self.CONGESTION_RADIUS and sender_id < self.agent_id:
                     return True
         return False
 
     def _check_stale_information(self) -> None:
-        for tid in range(len(self.all_tasks)):
-            if self.all_tasks[tid].completed: 
+        """
+        Identifies and resets expired task information.
+        
+        Prevents "Ghost Tasks" (tasks owned by agents who have left the 
+        network or crashed) from blocking assignment indefinitely.
+        """
+        for task_id in range(len(self.all_tasks)):
+            if self.all_tasks[task_id].completed:
                 continue
-            if self.assigned_agent_list[tid] == self.agent_id: 
+            if self.assigned_agent_list[task_id] == self.agent_id: 
                 continue
-            if self.assigned_agent_list[tid] == -1: 
+            if self.assigned_agent_list[task_id] == -1: 
                 continue
-            if self.significance_list[tid] == self.HARD_LOCK_SIG: 
-                continue
-
-            if (self.current_time - self.task_timestamps[tid]) > self.STALE_TIMEOUT:
-                self.assigned_agent_list[tid] = -1
-                self.significance_list[tid] = INFINITY
-                self.task_timestamps[tid] = self.current_time
-                if tid in self.known_execution_locks:
-                    del self.known_execution_locks[tid]
+            
+            # If info is older than threshold, reset to unassigned
+            if (self.current_time - self.task_timestamps[task_id]) > self.STALE_TIMEOUT:
+                self.assigned_agent_list[task_id] = -1
+                self.significance_list[task_id] = SIG_INFINITY
+                self.task_timestamps[task_id] = self.current_time
 
     def _cleanup_blacklist(self) -> None:
-        expired = [tid for tid, expiry in self.blacklist.items() if self.current_time >= expiry]
-        for tid in expired:
+        """Removes expired entries from the blacklist."""
+        expired_tasks = [tid for tid, expiry in self.blacklist.items() if self.current_time >= expiry]
+        for tid in expired_tasks:
             del self.blacklist[tid]
-    
-    def _update_internal_significance(self, penalty: float) -> None:
-        """Helper to update local bids after path changes."""
-        for tid in self.tasks_sequence_list:
-            new_sig = self._calculate_significance(self.all_tasks[tid])
-            if self._is_currently_congested: 
-                new_sig += penalty
-            if abs(new_sig - self.significance_list[tid]) > 1e-6:
-                self.significance_list[tid] = new_sig
 
-    # *******************************************************
-    # Cost Calculations (Robust V2 Version)
-    # *******************************************************
+    # --- Core Cost Calculations (Physical Layer) ---
 
     def _calculate_total_path_cost(self, path: List[int]) -> float:
         """
-        Calculates cost with STRICT Deadline constraints. 
-        Returns INFINITY if any deadline is violated.
+        Calculates the total time cost for a task sequence starting from 
+        the agent's *current* dynamic position.
+        
+        Returns:
+            Total time in seconds. Returns SIG_INFINITY if infeasible.
         """
-        # [Fix] Use explicit None check so type checker knows it's safe afterwards
         if self.agent is None: 
-            return INFINITY
-
+            return SIG_INFINITY
         cost = 0.0
         curr_pos = self.agent.position
         current_arrival_time = self.current_time 
-
-        for tid in path:
-            task = self.all_tasks[tid]
+        
+        for task_id in path:
+            task = self.all_tasks[task_id]
             dist = np.linalg.norm(task.position - curr_pos)
             travel_time = dist / self.agent.speed
             
-            current_arrival_time += travel_time
-            if current_arrival_time > task.deadline:
-                return INFINITY
-
+            arrival_at_task = current_arrival_time + travel_time
+            if arrival_at_task > task.deadline:
+                return SIG_INFINITY
+            
             cost += travel_time + task.exec_duration
-            current_arrival_time += task.exec_duration
+            current_arrival_time = arrival_at_task + task.exec_duration
             curr_pos = task.position
-
         return cost
 
-    def _calculate_significance(self, task: Task) -> float:
-        if task.id not in self.tasks_sequence_list: 
-            return INFINITY
+    def _calculate_significance(self, task_id: int) -> float:
+        """
+        Calculates the significance (marginal cost contribution) of a task.
+        Significance = Cost(Path) - Cost(Path without task).
+        """
+        if task_id not in self.tasks_sequence_list: 
+            return SIG_INFINITY
         
         cost_with = self._calculate_total_path_cost(self.tasks_sequence_list)
-        
-        # If path is invalid, significance is compromised (return INF to trigger removal)
-        if math.isinf(cost_with):
-            return INFINITY
-
-        temp = self.tasks_sequence_list.copy()
-        temp.remove(task.id)
-        cost_without = self._calculate_total_path_cost(temp)
+        if math.isinf(cost_with): 
+            return SIG_INFINITY
+            
+        temp_sequence = self.tasks_sequence_list.copy()
+        temp_sequence.remove(task_id)
+        cost_without = self._calculate_total_path_cost(temp_sequence)
         
         return cost_with - cost_without
 
     def _calculate_marginal_significance(self, task: Task) -> Tuple[float, int]:
-        min_marginal = INFINITY
+        """
+        Calculates the marginal significance (insertion cost) of adding a new task.
+        Returns the minimum cost increase and the best insertion index.
+        """
+        assert self.agent is not None
+
+        min_marginal = SIG_INFINITY
         best_pos = -1
         base_cost = self._calculate_total_path_cost(self.tasks_sequence_list)
         
-        # If base path is already broken, we can't add anything
         if math.isinf(base_cost) and len(self.tasks_sequence_list) > 0:
-             return INFINITY, -1
-
+             return SIG_INFINITY, -1
+        
         for i in range(len(self.tasks_sequence_list) + 1):
-            temp = self.tasks_sequence_list.copy()
-            temp.insert(i, task.id)
-            new_cost = self._calculate_total_path_cost(temp)
-            
-            if math.isinf(new_cost):
+            # [Hard Lock Protection] Cannot insert at index 0 if executing
+            if i == 0 and self.agent.status == 'EXECUTING' and len(self.tasks_sequence_list) > 0:
                 continue
-
+            
+            temp_sequence = self.tasks_sequence_list.copy()
+            temp_sequence.insert(i, task.id)
+            new_cost = self._calculate_total_path_cost(temp_sequence)
+            
+            if math.isinf(new_cost): 
+                continue
+                
             marginal = new_cost - base_cost
             if marginal < min_marginal:
                 min_marginal = marginal
                 best_pos = i
         return min_marginal, best_pos
-
-    def _calculate_reach_time(self, task_id: int, pos: int) -> float:
-        # [Fix] Ensure agent is bound
-        assert self.agent is not None
-
-        cost = 0.0
-        curr_pos = self.agent.position
-        for tid in self.tasks_sequence_list[:pos]:
-            t = self.all_tasks[tid]
-            cost += np.linalg.norm(t.position - curr_pos) / self.agent.speed + t.exec_duration
-            curr_pos = t.position
-        target = self.all_tasks[task_id]
-        return cost + np.linalg.norm(target.position - curr_pos) / self.agent.speed
 
 ##### END FILE: ./algorithms/dynamic_pi.py #####
 
@@ -736,6 +742,10 @@ class AlgorithmFactory:
 
 ##### END FILE: ./algorithms/factory.py #####
 
+##### FILE: ./algorithms/__init__.py #####
+
+
+##### END FILE: ./algorithms/__init__.py #####
 
 ##### FILE: ./algorithms/original_pi.py #####
 
@@ -745,72 +755,65 @@ class AlgorithmFactory:
 # --------------------------------------------------------
 
 import numpy as np
-import math
 from typing import List, Dict, Any, Tuple
 from algorithms.base import BaseAlgorithm
 from core.agent import Agent
 from core.task import Task
 
-# Use positive infinity for initial cost values
+# Use positive infinity for initial cost values to represent unassigned states
 INFINITY = float('inf')
 
 class OriginalPI(BaseAlgorithm):
     """
-    Implements the original PI Algo.
+    Implements the Original Performance Impact (PI) Algorithm.
 
-    This class provides the core logic for the Performance Impact (PI) algorithm,
-    which is a distributed task allocation method based on market-based auctions.
-    It iterates through three phases: Task Inclusion, Consensus, and Task Removal.
+    This class provides the core logic for the Performance Impact algorithm,
+    strictly following the iterative three-phase procedure described in the paper.
+    It focuses on minimizing the total global cost (time) while respecting
+    temporal constraints (deadlines).
+
+    Phases:
+        1. Task Inclusion: Greedily add tasks that maximize marginal gain.
+        2. Consensus: Resolve conflicts using CBBA rules (Consensus-Based Bundle Algorithm).
+        3. Task Removal: Iteratively remove tasks that are outbid or become inefficient.
 
     References:
         Zhao et al., "A Heuristic Distributed Task Allocation Method for Multivehicle
         Multitask Problems and Its Application to Search and Rescue Scenario",
-        [cite_start]IEEE Transactions on Cybernetics, 2016. [cite: 3]
-
-    Features:
-        - Uses Vector Clocks (`timestamp_list`) for consensus to resolve conflicts.
-        - Designed primarily for static allocation phases where agents reach.
-          consensus before execution.
-        - Implements the iterative greedy removal strategy for handling task synergies.
+        IEEE Transactions on Cybernetics, 2016.
     """
 
     def __init__(self, agent_id: int, max_tasks: int, all_tasks: List[Task]) -> None:
-        """
-        Initializes the PI algorithm state.
+        """Initializes the PI algorithm state.
 
         Args:
-            agent_id: The unique ID of the agent running this algorithm.
-            max_tasks: The maximum number of tasks this agent can carry.
-            all_tasks: A reference list of all available tasks in the environment.
+            agent_id (int): The unique ID of the agent running this algorithm.
+            max_tasks (int): The maximum number of tasks this agent can carry (capacity).
+            all_tasks (List[Task]): A reference list of all available tasks in the environment.
         """
         super().__init__(agent_id, max_tasks, all_tasks)
-
         num_tasks = len(all_tasks)
         
-        # --- PI Algorithm State ---
-        # a: The current sequence of tasks assigned to the agent
+        # --------- 1. PI Algorithm State ---------
+        # a: The current sequence of tasks assigned to this agent (ordered list)
         self.tasks_sequence_list: List[int] = []
         # γ: The significance list
         self.significance_list: List[float] = [INFINITY] * num_tasks
-        # γ*: The marginal significance list
-        self.marginal_significance_list: List[float] = [0.0] * num_tasks
         # β: The assigned list
         self.assigned_agent_list: List[int] = [-1] * num_tasks
         
-        # --- Consensus State ---
+        # --------- 2. Consensus State ---------
         # δ: the timestamp list
         self.timestamp_list: List[float] = [] 
+
         # Reference to the physical agent
-        self.agent: Any = None  
+        self.agent: Any = None
         # Iteration step
         self.current_time = 0.0
         
     def bind_agent(self, agent: Agent):
         """
         Binds the physical agent instance to the algorithm.
-
-        This allows the algorithm to access the agent's current position and speed
-        for cost calculations.
 
         Args:
             agent: The physical Agent instance.
@@ -831,9 +834,7 @@ class OriginalPI(BaseAlgorithm):
         self.timestamp_list = [0.0] * num_agents
 
     def get_plan(self) -> List[int]:
-        """
-        Returns the current planned sequence of tasks.
-        """
+        """Returns the current planned sequence of task IDs."""
         return self.tasks_sequence_list
 
     def pack_message(self) -> Dict[str, Any]:
@@ -843,9 +844,9 @@ class OriginalPI(BaseAlgorithm):
         Returns:
             A dictionary containing:
                 - sender_id: ID of this agent.
-                - significance_list: The list of bids.
+                - significance_list: The list of bids/costs.
                 - assigned_agent_list: The list of task owners.
-                - timestamp_list: The vector clock.
+                - timestamp_list: The vector clock for consensus.
         """
         return {
             "sender_id": self.agent_id,
@@ -857,9 +858,6 @@ class OriginalPI(BaseAlgorithm):
     def on_task_completed(self, task_id: int) -> None:
         """
         Callback handler for when a task is physically completed.
-
-        Removes the completed task from the internal sequence to prevent re-execution
-        and potential infinite loops during the execution phase.
 
         Args:
             task_id: The ID of the completed task.
@@ -879,166 +877,283 @@ class OriginalPI(BaseAlgorithm):
         Args:
             messages: A list of messages received from neighboring agents.
         """
-        # --- 1. Tasks Inclusion ---
+        # --------- Phase 1: Tasks Inclusion ---------
         self._task_inclusion_phase()
         
-        # --- 2. Information Consensus ---
+        # --------- Phase 2: Information Consensus ---------
         self._consensus_phase(messages)
         
-        # --- 3. Tasks Removal ---
+        # --------- Phase 3: Tasks Removal ---------
         self._task_removal_phase()
 
-        # Update local clock
+        # Update logical clock at the end of the iteration
         self.current_time += 1.0
         if self.timestamp_list:
             self.timestamp_list[self.agent_id] = self.current_time
 
-    # ******************************* 
+    # ************************************************************** 
     # Phase Implementations
-    # ******************************* 
+    # ************************************************************** 
     def _task_inclusion_phase(self) -> None:
         """
-        Greedily adds tasks to the bundle.
-
-        Iteratively finds the best unassigned task that maximizes the bid improvement
-        (difference between current network bid and my marginal cost) and inserts it
-        into the best position in the path.
+        Phase 1: Greedily adds tasks to the bundle.
+        
+        The agent iteratively selects the unassigned task that 
+        maximizes the difference between the current global significance
+        and the agent's marginal significance 
         """
         while len(self.tasks_sequence_list) < self.max_tasks:
-            max_diff = -1.0
-            best_task = -1
-            best_pos = -1
+            max_significance_gain = 0.0
+            best_task_id = -1
+            best_insertion_index = -1
 
+            # Iterate through each task to find the best candidate
             for task in self.all_tasks:
-                # Skip if already in my list
+                # Skip if already in my local schedule
                 if task.id in self.tasks_sequence_list: 
                     continue
+
                 # Skip if I cannot physically perform this task type
                 if not self.feasibility_matrix[self.agent_id][task.id]: 
                     continue
 
-                # Calculate cost to insert this task
-                marginal, pos = self._calculate_marginal_significance(task)
+                # Calculate the marginal significance if we add this task
+                marginal_significance, position = self._calculate_marginal_significance(task)
                 
-                # Check constraint 5: Deadline
-                if self._calculate_reach_time(task.id, pos) >= task.deadline:
+                # If the task cannot be added due to constraints, skip it
+                if marginal_significance == INFINITY:
                     continue
 
-                # Store the marginal significance
-                self.marginal_significance_list[task.id] = marginal
+                # Calculate potential gain: (Current Global Significance - My Marginal Significance)
+                current_global_significance = self.significance_list[task.id]
+                gain = current_global_significance - marginal_significance
 
-                # Calculate potential gain
-                # Find the task that maximizes cost reduction
-                diff = self.significance_list[task.id] - marginal
+                # Track the task that offers the highest gain
+                if gain > max_significance_gain:
+                    max_significance_gain = gain
+                    best_task_id = task.id
+                    best_insertion_index = position
 
-                if diff > max_diff:
-                    max_diff = diff
-                    best_task = task.id
-                    best_pos = pos
-
-            # If an optimizable task is found, add it to the task list
-            if max_diff > 0:
-                self.tasks_sequence_list.insert(best_pos, best_task)
-                self.significance_list[best_task] = self.marginal_significance_list[best_task]
-                self.assigned_agent_list[best_task] = self.agent_id
+            # If a profitable task is found, add it to the sequence
+            if max_significance_gain > 0 and best_task_id != -1:
+                self.tasks_sequence_list.insert(best_insertion_index, best_task_id)
+                
+                # Update internal state for the new task
+                self.significance_list[best_task_id] = self._calculate_significance(best_task_id)
+                self.assigned_agent_list[best_task_id] = self.agent_id
             else:
-                # No more tasks can be added profitably
+                # Stop if no task improves the objective function
                 break
 
-        # Cascade Update: Adding a task changes costs for all tasks in the path
-        # We must update the significance values for all owned tasks
-        for tid in self.tasks_sequence_list:
-            self.significance_list[tid] = self._calculate_significance(self.all_tasks[tid])
+        # Cascade Update: Adding a task changes the position and costs of 
+        # other tasks in the sequence. Update significance for all owned tasks.
+        self._update_internal_significance()
 
-    def _consensus_phase(self, messages: List[Dict]) -> None:
+    def _consensus_phase(self, messages: List[Dict]):
         """
-        Resolves conflicts by comparing bids with neighbors.
+        Phase 2: Information Consensus using CBBA Rules.
 
-        Uses standard consensus rules:
-            1. Update vector clock to max values.
-            2. Compare bids (significance). Lower bid (cost) wins.
-            3. Use agent ID as tie-breaker.
+        Resolves conflicts based on the Consensus-Based Bundle Algorithm decision rules.
+        It handles information staleness using vector clocks and determines winning bids
+        based on minimizing significance (cost).
 
         Args:
-            messages: Incoming messages from neighbors.
+            messages: A list of message dictionaries from neighbors.
         """
         for msg in messages:
-            neighbor_sig = msg['significance_list']
-            neighbor_assign = msg['assigned_agent_list']
-            neighbor_time = msg['timestamp_list']
+            sender_id = msg['sender_id']
+            neighbor_y = msg['significance_list']
+            neighbor_z = msg['assigned_agent_list']
+            neighbor_s = msg['timestamp_list']
 
-            # Update vector clock
-            for i in range(len(self.timestamp_list)):
-                self.timestamp_list[i] = max(self.timestamp_list[i], neighbor_time[i])
-            
-            # Update significance for each task
-            for tid in range(len(self.all_tasks)):
-                y_kj = neighbor_sig[tid]
-                z_kj = neighbor_assign[tid]
-                y_ij = self.significance_list[tid]
-                z_ij = self.assigned_agent_list[tid]
-                
-                # Update Rule: Adopt neighbor's info if their significance is better (lower)
-                if y_kj < y_ij:
-                    self.significance_list[tid] = y_kj
-                    self.assigned_agent_list[tid] = z_kj
-                # Tie-breaker: If significance are equal, lower Agent ID wins
-                elif math.isclose(y_kj, y_ij) and z_kj < z_ij:
-                    self.significance_list[tid] = y_kj
-                    self.assigned_agent_list[tid] = z_kj
+            # Iterate over every task to resolve potential conflicts
+            for j in range(len(self.all_tasks)):
+                # --- Aliases for CBBA logic readability ---
+                k = sender_id               # Sender
+                i = self.agent_id           # Self
+
+                # State values
+                z_kj = neighbor_z[j]                # Who k thinks owns j
+                z_ij = self.assigned_agent_list[j]  # Who i thinks owns j
+                y_kj = neighbor_y[j]                # k's cost for j
+                y_ij = self.significance_list[j]    # i's cost for j
+
+                # Timestamps
+                # s_km: k's timestamp about agent m
+                # s_im: i's timestamp about agent m
+
+                action = 'LEAVE' # Default
+
+                # --- Helper: Comparison Logic ---
+                def is_neighbor_better(n_cost, my_cost, n_id, my_id):
+                    """Returns True if neighbor has lower cost, or ties with lower ID."""
+                    if n_cost < my_cost: 
+                        return True
+                    if abs(n_cost - my_cost) < 1e-6 and n_id < my_id: 
+                        return True # Tie-breaker
+                    return False
+
+                # --- CBBA Decision Table Implementation ---
+                # Case A: Sender thinks Sender (k) owns it
+                if z_kj == k:
+                    # 1. I think I (i) own it -> Direct Conflict
+                    if z_ij == i:
+                        if is_neighbor_better(y_kj, y_ij, k, i):
+                            action = 'UPDATE'
+                    # 2. I think Sender (k) owns it -> Update bid if changed
+                    elif z_ij == k:
+                        action = 'UPDATE'
+                    # 3. I think it's unassigned -> Update
+                    elif z_ij == -1:
+                        action = 'UPDATE'
+                    # 4. I think a third party (m) owns it
+                    else:
+                        m = z_ij
+                        s_km = neighbor_s[m]
+                        s_im = self.timestamp_list[m]
+                        # Update if sender has newer info about m OR sender beats m's bid
+                        if s_km > s_im or is_neighbor_better(y_kj, y_ij, k, m):
+                            action = 'UPDATE'
+
+                # Case B: Sender thinks I (i) own it
+                elif z_kj == i:
+                    if z_ij == i:
+                        action = 'LEAVE'
+                    elif z_ij == k:
+                        # Sender says I have it, I say Sender has it -> Sender is confused or I am stale
+                        action = 'RESET'
+                    elif z_ij == -1:
+                        action = 'LEAVE'
+                    else: # z_ij == m
+                        m = z_ij
+                        # s_km > s_im
+                        if neighbor_s[m] > self.timestamp_list[m]:
+                            action = 'RESET' # Sender knows m is out
+
+                # Case C: Sender thinks it's Empty (-1)
+                elif z_kj == -1:
+                    if z_ij == i:
+                        action = 'LEAVE'
+                    elif z_ij == k:
+                        action = 'UPDATE' # Sender released it
+                    elif z_ij == -1:
+                        action = 'LEAVE'
+                    else: # z_ij == m
+                        m = z_ij
+                        # s_km > s_im
+                        if neighbor_s[m] > self.timestamp_list[m]:
+                            action = 'UPDATE' # Sender knows m is out
+
+                # Case D: Sender thinks Other (m) owns it
+                else: # z_kj == m
+                    m = z_kj
+                    if z_ij == i:
+                        # s_km > s_im
+                        if neighbor_s[m] > self.timestamp_list[m] and is_neighbor_better(y_kj, y_ij, m, i):
+                            action = 'UPDATE'
+                    elif z_ij == k:
+                        # s_km > s_im
+                        if neighbor_s[m] > self.timestamp_list[m]:
+                            action = 'UPDATE'
+                        else:
+                            action = 'RESET'
+                    elif z_ij == -1:
+                        # s_km > s_im
+                        if neighbor_s[m] > self.timestamp_list[m]:
+                            action = 'UPDATE'
+                    elif z_ij == m:
+                        # s_km > s_im
+                        if neighbor_s[m] > self.timestamp_list[m]:
+                            action = 'UPDATE'
+                    else: # z_ij == n 
+                        n = z_ij
+                        s_km = neighbor_s[m] # Sender's knowledge of m
+                        s_im = self.timestamp_list[m] # My knowledge of m
+                        s_kn = neighbor_s[n] # Sender's knowledge of n
+                        s_in = self.timestamp_list[n] # My knowledge of n
+
+                        # Logic from CBBA Table Col 4 Row 4
+                        if s_km > s_im and s_kn > s_in:
+                            action = 'UPDATE'
+                        elif s_km > s_im and is_neighbor_better(y_kj, y_ij, m, n):
+                            action = 'UPDATE'
+                        elif s_kn > s_in and s_im > s_km:
+                            action = 'RESET'
+                        else:
+                            action = 'LEAVE'
+
+                # --- Execute Action ---
+                if action == 'UPDATE':
+                    self.significance_list[j] = y_kj
+                    self.assigned_agent_list[j] = z_kj
+                elif action == 'RESET':
+                    self.significance_list[j] = INFINITY
+                    self.assigned_agent_list[j] = -1
+
+            for k_idx in range(len(self.timestamp_list)):
+                self.timestamp_list[k_idx] = max(self.timestamp_list[k_idx], neighbor_s[k_idx])
 
     def _task_removal_phase(self) -> None:
         """
-        Removes tasks that are invalid or outbid.
+        Phase 3: Iterative Greedy Task Removal.
 
-        Implements the Iterative Greedy Removal strategy proposed in Zhao et al. (2016).
-        Instead of removing all invalid tasks at once, it iteratively removes the task
-        whose removal causes the least "loss" (or most "gain"), re-evaluating synergies
-        after each removal.
+        Identifies tasks that should be removed because:
+        1. The agent lost ownership during consensus (outbid).
+        2. The task is no longer efficient to keep (constraint violation or synergy loss).
         """
-        # --- 1. Identify the initial set of tasks that MUST be checked for removal ---
+        # 1. Identify tasks that are definitely lost (ownership changed externally)
         tasks_to_check_for_removal = {
             task_id
             for task_id in self.tasks_sequence_list
-            if self.assigned_agent_list[task_id] != self.agent.id
+            if self.assigned_agent_list[task_id] != self.agent_id
         }
 
-        # --- 2. Iteratively remove tasks until the set is clean ---
-        while tasks_to_check_for_removal:
+        # 2. Iteratively remove tasks until the set is clean
+        while len(tasks_to_check_for_removal) > 0:
             max_reduction = -INFINITY
             task_to_remove = -1
-            # Evaluate which removal is "best"
-            # Find the task whose removal can maximize improvement (reduction) in cost
-            for task_id in tasks_to_check_for_removal:
-                current_significance = self._calculate_significance(self.all_tasks[task_id])
-                global_significance = self.significance_list[task_id]
 
-                reduction = current_significance - global_significance
+            # Find the task whose removal maximizes the reduction in cost discrepancy
+            for tid in tasks_to_check_for_removal:
+                local_significance = self._calculate_significance(tid)
+                global_significance = self.significance_list[tid]
+
+                # Difference between what I pay (local) and what the market pays (global)
+                # If local > global, I am inefficient and should consider removing.
+                reduction = local_significance - global_significance
+
                 if reduction > max_reduction:
                     max_reduction = reduction
-                    task_to_remove = task_id
+                    task_to_remove = tid
             
-            # --- 3. Execute removal ---
+            # Execute removal if it helps alignment with global state
             if max_reduction > 0:
                 self.tasks_sequence_list.remove(task_to_remove)
                 tasks_to_check_for_removal.remove(task_to_remove)
             else:
+                # If no more removals improve the situation, stop.
                 break 
 
-    # ********************************** 
+        # 3. Re-confirm ownership of remaining tasks
+        # Any task still in my list is mine, and I update its significance based on the new path.
+        for tid in self.tasks_sequence_list:
+            if self.assigned_agent_list[tid] != self.agent_id:
+                self.assigned_agent_list[tid] = self.agent_id
+                self.significance_list[tid] = self._calculate_significance(tid)
+
+    # ************************************************************** 
     # Math Helpers (Cost Calculation)
-    # ********************************** 
+    # ************************************************************** 
     def _calculate_total_path_cost(self, path: List[int]) -> float:
         """
-        Calculates the total time cost to execute a sequence of tasks.
+        Calculates the total time cost (travel + execution) for a task sequence.
 
         Args:
-            path: A list of task IDs representing the execution order.
+            sequence: A list of task IDs.
 
         Returns:
-            Total time (travel + execution) in seconds. Returns INFINITY if agent is unbound.
+            Total time in seconds. Returns INFINITY if deadlines are violated.
         """
-
         # Safety check: Ensure agent is bound
         if not self.agent:
             return INFINITY
@@ -1052,7 +1167,7 @@ class OriginalPI(BaseAlgorithm):
             curr_pos = task.position
         return cost
 
-    def _calculate_significance(self, task: Task) -> float:
+    def _calculate_significance(self, task_id) -> float:
         """
         Calculates the significance (marginal cost contribution) of a task.
 
@@ -1064,15 +1179,20 @@ class OriginalPI(BaseAlgorithm):
         Returns:
             The marginal cost value. Returns INFINITY if task is not in the list.
         """
-        if task.id not in self.tasks_sequence_list: 
-            return INFINITY
+        if task_id not in self.tasks_sequence_list: 
+            return 0.0
 
-        cost_with = self._calculate_total_path_cost(self.tasks_sequence_list)
+        # 1. Calculates current total cost (baseline cost)
+        base_cost = self._calculate_total_path_cost(self.tasks_sequence_list)
 
-        temp = self.tasks_sequence_list.copy()
-        temp.remove(task.id)
-        cost_without = self._calculate_total_path_cost(temp)
-        return cost_with - cost_without
+        # 2. Simulate the task chain after removal
+        temp_sequence = self.tasks_sequence_list.copy()
+        temp_sequence.remove(task_id)
+
+        # 3. Calculate the total cost after removal
+        reduced_cost = self._calculate_total_path_cost(temp_sequence)
+
+        return base_cost - reduced_cost
 
     def _calculate_marginal_significance(self, task: Task) -> Tuple[float, int]:
         """
@@ -1087,19 +1207,28 @@ class OriginalPI(BaseAlgorithm):
         Returns:
             A tuple (min_marginal_cost, best_insertion_index).
         """
-        min_marginal = INFINITY
-        best_pos = -1
+        min_marginal_cost = INFINITY
+        best_position = -1
+
+        # Calculates the execution cost of the current task sequence (baseline cost)
         base_cost = self._calculate_total_path_cost(self.tasks_sequence_list)
         
+        # Iterates through all possible insertion points in the current path
         for i in range(len(self.tasks_sequence_list) + 1):
-            temp = self.tasks_sequence_list.copy()
-            temp.insert(i, task.id)
-            new_cost = self._calculate_total_path_cost(temp)
-            marginal = new_cost - base_cost
-            if marginal < min_marginal:
-                min_marginal = marginal
-                best_pos = i
-        return min_marginal, best_pos
+            temp_task_sequence = self.tasks_sequence_list.copy()
+            temp_task_sequence.insert(i, task.id)
+
+            # Check temporal constraints
+            if not self._is_path_valid(temp_task_sequence):
+                continue
+
+            # Calculate the cost after insertion
+            new_cost = self._calculate_total_path_cost(temp_task_sequence)
+            marginal_cost = new_cost - base_cost
+            if marginal_cost < min_marginal_cost:
+                min_marginal_cost = marginal_cost
+                best_position = i
+        return min_marginal_cost, best_position
 
     def _calculate_reach_time(self, task_id: int, pos: int) -> float:
         """
@@ -1123,13 +1252,53 @@ class OriginalPI(BaseAlgorithm):
 
         # Calculate time to traverse the path up to the insertion point
         for tid in self.tasks_sequence_list[:pos]:
-            t = self.all_tasks[tid]
-            cost += np.linalg.norm(t.position - curr_pos) / self.agent.speed + t.exec_duration
-            curr_pos = t.position
+            task = self.all_tasks[tid]
+            cost += np.linalg.norm(task.position - curr_pos) / self.agent.speed + task.exec_duration
+            curr_pos = task.position
 
         # Add travel time to the target task itself
         target = self.all_tasks[task_id]
         return cost + np.linalg.norm(target.position - curr_pos) / self.agent.speed
+
+    def _is_path_valid(self, sequence: List[int]) -> bool:
+        """
+        Checks if a task sequence satisfies all temporal constraints (deadlines).
+
+        Args:
+            sequence: List of task IDs.
+
+        Returns:
+            True if feasible, False otherwise.
+        """
+        current_time = self.current_time
+        current_position = self.agent.position
+        
+        for task_id in sequence:
+            task = self.all_tasks[task_id]
+            
+            # 1. Calculate the time required to reach the task (flight time)
+            dist = np.linalg.norm(task.position - current_position)
+            travel_time = dist / self.agent.speed
+            
+            # 2. Update estimated arrival time
+            arrival_time = current_time + travel_time
+            
+            # 3. Critical check: does the task exceed its deadline?
+            #    If any single task in the chain misses its deadline, the entire chain becomes invalid
+            if arrival_time > task.deadline:
+                return False
+            
+            # 4. Update current time and position for evaluating the next task
+            #    (Task execution itself also requires duration `exec_duration`)
+            current_time = arrival_time + task.exec_duration
+            current_position = task.position
+            
+        return True
+
+    def _update_internal_significance(self):
+        """Recalculates significance values for all tasks in the local bundle."""
+        for tid in self.tasks_sequence_list:
+            self.significance_list[tid] = self._calculate_significance(tid)
 
 ##### END FILE: ./algorithms/original_pi.py #####
 
@@ -1366,7 +1535,7 @@ class Environment:
         self.fixed_topology = fixed_topology  
 
     # *****************************************
-    # Mode 1: Dynamic Simulation (For V1, V2)
+    # Mode 1: Dynamic Simulation
     # *****************************************
     def run_dynamic_simulation(self, dt: float, max_time: float) -> Iterator[Dict[str, Any]]:
         """
@@ -1620,6 +1789,10 @@ class Environment:
 
 ##### END FILE: ./core/environment.py #####
 
+##### FILE: ./core/__init__.py #####
+
+
+##### END FILE: ./core/__init__.py #####
 
 ##### FILE: ./core/task.py #####
 
@@ -2308,4 +2481,9 @@ class Animator:
         plt.show()
 
 ##### END FILE: ./visualization/animator.py #####
+
+##### FILE: ./visualization/__init__.py #####
+
+
+##### END FILE: ./visualization/__init__.py #####
 
